@@ -2,6 +2,7 @@
   "imports": {
     "@supabase/functions-js": "jsr:@supabase/functions-js@^2",
     "plaid": "npm:plaid@^27",
-    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2"
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2",
+    "@panva/jose": "jsr:@panva/jose@6"
   }
 }

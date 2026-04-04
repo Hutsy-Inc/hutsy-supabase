@@ -22,100 +22,133 @@
  *
  * Example Usage:
  * See the code comments for a sample `curl` command to invoke this function locally.
- */
-import "@supabase/functions-js/edge-runtime.d.ts"
-import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode, LinkTokenCreateRequest, DepositoryAccountSubtype, CreditAccountSubtype } from 'plaid'
-
+ */ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from "npm:plaid";
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-}
-
-
-Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS"
+};
+Deno.serve(async (req)=>{
+  if (req.method === "OPTIONS") {
+    return new Response("ok", {
+      headers: corsHeaders
+    });
   }
-
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({
+      error: "Method not allowed"
+    }), {
+      status: 405,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/json"
+      }
+    });
+  }
   try {
-    const PLAID_CLIENT_ID = Deno.env.get('PLAID_CLIENT_ID')
-    const PLAID_SECRET = Deno.env.get('PLAID_SECRET')
-    const PLAID_ENV = Deno.env.get('PLAID_ENV') || 'sandbox'
-
-    if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
-      throw new Error('Missing Plaid credentials')
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) {
+      return new Response(JSON.stringify({
+        error: "Missing Authorization header"
+      }), {
+        status: 401,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
+    const supabaseClient = createClient(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_ANON_KEY") ?? "", {
+      global: {
+        headers: {
+          Authorization: authHeader
+        }
+      }
+    });
+    const { data: userData, error: userError } = await supabaseClient.auth.getUser();
+    if (userError || !userData.user) {
+      console.error("[create_plaid_link] auth.getUser failed", userError);
+      return new Response(JSON.stringify({
+        error: "Unauthorized"
+      }), {
+        status: 401,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json"
+        }
+      });
+    }
+    const user = userData.user;
+    const PLAID_CLIENT_ID = Deno.env.get("PLAID_CLIENT_ID");
+    const PLAID_SECRET = Deno.env.get("PLAID_SECRET");
+    const PLAID_ENV = Deno.env.get("PLAID_ENV") || "sandbox";
+    const PLAID_IOS_REDIRECT_URI = Deno.env.get("PLAID_IOS_REDIRECT_URI") || "";
+    const PLAID_ANDROID_PACKAGE_NAME = Deno.env.get("PLAID_ANDROID_PACKAGE_NAME") || "";
+    if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
+      throw new Error("Missing Plaid credentials");
+    }
     const configuration = new Configuration({
       basePath: PlaidEnvironments[PLAID_ENV],
       baseOptions: {
         headers: {
-          'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
-          'PLAID-SECRET': PLAID_SECRET,
-        },
-      },
-    })
-
-    const plaidClient = new PlaidApi(configuration)
-
-
-    const { email, phone } = await req.json()
-
-    if (!email) {
-      return new Response(
-        JSON.stringify({ error: 'email is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      )
-    }
-
-    const request: LinkTokenCreateRequest = {
+          "PLAID-CLIENT-ID": PLAID_CLIENT_ID,
+          "PLAID-SECRET": PLAID_SECRET
+        }
+      }
+    });
+    const plaidClient = new PlaidApi(configuration);
+    const webhookUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/plaid-webhook`;
+    const body = await req.json().catch(()=>({}));
+    const platform = (body?.platform ?? "").toString().toLowerCase();
+    const request = {
       user: {
-        client_user_id: email,
-        ...(phone && { phone_number: phone }),
+        client_user_id: user.id
       },
-      client_name: 'Hutsy Finance App',
-      products: [Products.Transactions],
-      transactions: {
-        days_requested: 730,
-      },
-      country_codes: [CountryCode.Ca],
-      language: 'en',
-      account_filters: {
-        depository: {
-          account_subtypes: [DepositoryAccountSubtype.Checking, DepositoryAccountSubtype.Savings],
-        },
-        credit: {
-          account_subtypes: [CreditAccountSubtype.CreditCard],
-        },
-      },
+      client_name: "Hutsy",
+      products: [
+        Products.Transactions,
+        Products.Auth
+      ],
+      country_codes: [
+        CountryCode.Us
+      ],
+      language: "en",
+      webhook: webhookUrl
+    };
+    if (platform === "ios" && PLAID_IOS_REDIRECT_URI) {
+      request.redirect_uri = PLAID_IOS_REDIRECT_URI;
     }
-
-    const response = await plaidClient.linkTokenCreate(request)
-    const linkToken = response.data.link_token
-
-    return new Response(
-      JSON.stringify({ link_token: linkToken }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    )
+    if (platform === "android" && PLAID_ANDROID_PACKAGE_NAME) {
+      request.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
+    }
+    const response = await plaidClient.linkTokenCreate(request);
+    return new Response(JSON.stringify({
+      link_token: response.data.link_token
+    }), {
+      status: 200,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/json"
+      }
+    });
   } catch (error) {
-    console.error('Error creating Plaid link token:', error)
-
-    const errorMessage = error instanceof Error ? error.message : 'Failed to create link token'
-    const errorDetails = (error && typeof error === 'object' && 'response' in error)
-      ? (error.response as { data?: unknown })?.data
-      : null
-
-    return new Response(
-      JSON.stringify({
-        error: errorMessage,
-        details: errorDetails
-      }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    )
+    console.error("[create_plaid_link] Error:", error);
+    const errorMessage = error instanceof Error ? error.message : "Failed to create link token";
+    const errorDetails = error && typeof error === "object" && "response" in error ? error.response?.data : null;
+    return new Response(JSON.stringify({
+      error: errorMessage,
+      details: errorDetails
+    }), {
+      status: 500,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/json"
+      }
+    });
   }
-})
-
-/* To invoke locally:
+}); /* To invoke locally:
 
   1. Set environment variables in .env file:
      PLAID_CLIENT_ID=your_client_id
@@ -134,4 +167,4 @@ Deno.serve(async (req) => {
       "phone": "+1 415 5550123"
     }'
 
-*/
+*/ 
