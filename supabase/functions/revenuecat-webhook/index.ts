@@ -1,533 +1,292 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
-import { Configuration, PlaidApi, PlaidEnvironments } from "npm:plaid";
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from '@supabase/supabase-js';
+import { Configuration, PlaidApi, PlaidEnvironments } from 'plaid';
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function json(data, status = 200) {
+function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json"
-    }
+    headers: { 'Content-Type': 'application/json' },
   });
 }
-function buildAdminClient() {
-  return createClient(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "");
+
+function mapSource(store: string) {
+  const s = (store || '').toUpperCase().trim();
+  if (s === 'APP_STORE' || s === 'MAC_APP_STORE') return 'ios';
+  if (s === 'PLAY_STORE') return 'android';
+  if (s === 'STRIPE') return 'web';
+  if (s === 'TEST_STORE') return 'test';
+  return 'revenuecat';
 }
-function mapSource(store) {
-  const s = (store || "").toUpperCase().trim();
-  if (s === "APP_STORE" || s === "MAC_APP_STORE") return "ios";
-  if (s === "PLAY_STORE") return "android";
-  if (s === "STRIPE") return "web";
-  if (s === "TEST_STORE") return "test";
-  return "revenuecat";
+
+function mapPlan(productId: string) {
+  const pid = (productId || '').toLowerCase().trim();
+  if (pid.includes('year'))  return { plan: 'credit_builder', interval: 'year' };
+  if (pid.includes('month')) return { plan: 'credit_builder', interval: 'month' };
+  return { plan: 'credit_builder', interval: null };
 }
-function mapPlan(productId) {
-  const pid = (productId || "").toLowerCase().trim();
-  if (pid.includes("year")) return {
-    plan: "credit_builder",
-    interval: "year"
-  };
-  if (pid.includes("month")) return {
-    plan: "credit_builder",
-    interval: "month"
-  };
-  return {
-    plan: "credit_builder",
-    interval: null
-  };
-}
-function mapStatus(eventType, expirationAtMs) {
-  const t = (eventType || "").toUpperCase().trim();
+
+function mapStatus(eventType: string, expirationAtMs: number | null) {
+  const t = (eventType || '').toUpperCase().trim();
   const now = Date.now();
   const hasFutureExpiry = !!expirationAtMs && expirationAtMs > now;
-  switch(t){
-    case "INITIAL_PURCHASE":
-    case "RENEWAL":
-    case "UNCANCELLATION":
-    case "PRODUCT_CHANGE":
-      return "active";
-    case "BILLING_ISSUE":
-      return "past_due";
-    case "EXPIRATION":
-      return "expired";
-    case "CANCELLATION":
-      return hasFutureExpiry ? "active" : "cancelled";
+  switch (t) {
+    case 'INITIAL_PURCHASE':
+    case 'RENEWAL':
+    case 'UNCANCELLATION':
+    case 'PRODUCT_CHANGE':
+      return 'active';
+    case 'BILLING_ISSUE':
+      return 'past_due';
+    case 'EXPIRATION':
+      return 'expired';
+    case 'CANCELLATION':
+      return hasFutureExpiry ? 'active' : 'cancelled';
     default:
-      return hasFutureExpiry ? "active" : "expired";
+      return hasFutureExpiry ? 'active' : 'expired';
   }
 }
-function pickRealAppUserId(values) {
-  if (!Array.isArray(values)) return null;
-  for (const value of values){
-    const s = String(value || "").trim();
-    if (!s) continue;
-    if (s.startsWith("$RCAnonymousID:")) continue;
-    return s;
-  }
-  return null;
-}
-function isNonWebSource(source) {
-  const s = String(source || "").trim().toLowerCase();
-  return s === "ios" || s === "android" || s === "revenuecat" || s === "test";
-}
-// ---------------------------------------------------------------------------
-// Supabase helpers
-// ---------------------------------------------------------------------------
-async function getSubscriptionRowByUserId(db, userId) {
-  const { data, error } = await db.from("subscriptions").select("id, user_id, plan, interval, stripe_status, next_renewal, source").eq("user_id", userId).maybeSingle();
-  if (error) throw error;
-  return data ?? null;
-}
-async function upsertSubscriptionRowByUserId(db, userId, payload) {
-  const existingRow = await getSubscriptionRowByUserId(db, userId);
-  const updatePayload = {
-    plan: payload.plan,
-    interval: payload.interval,
-    stripe_status: payload.stripe_status,
-    source: payload.source,
-    updated_at: new Date().toISOString()
-  };
-  if ("next_renewal" in payload) {
-    updatePayload["next_renewal"] = payload.next_renewal ?? null;
-  }
-  // Important:
-  // If force_id is provided and differs from current row id, update the row id too.
-  if (payload.force_id) {
-    updatePayload["id"] = payload.force_id;
-  }
-  if (existingRow) {
-    const { error } = await db.from("subscriptions").update(updatePayload).eq("user_id", userId);
-    if (error) throw error;
-    return {
-      action: "updated",
-      id: String(payload.force_id || existingRow.id)
-    };
-  }
-  const insertId = String(payload.force_id || `rc_${userId}`);
-  const { error } = await db.from("subscriptions").insert({
-    id: insertId,
-    user_id: userId,
-    plan: payload.plan,
-    interval: payload.interval,
-    stripe_status: payload.stripe_status,
-    next_renewal: payload.next_renewal ?? null,
-    source: payload.source,
-    updated_at: new Date().toISOString()
-  });
-  if (error) throw error;
-  return {
-    action: "inserted",
-    id: insertId
-  };
-}
-async function deleteOldTransferredNonWebRow(db, userId) {
-  const existingRow = await getSubscriptionRowByUserId(db, userId);
-  if (!existingRow) {
-    return {
-      deleted: false,
-      reason: "no_row"
-    };
-  }
-  const source = String(existingRow.source || "").trim().toLowerCase();
-  const rowId = String(existingRow.id || "").trim();
-  const looksLikeNonWebSource = isNonWebSource(source) || rowId.startsWith("rc_");
-  if (!looksLikeNonWebSource) {
-    return {
-      deleted: false,
-      reason: "source_is_web_or_unknown"
-    };
-  }
-  const { error } = await db.from("subscriptions").delete().eq("user_id", userId);
-  if (error) throw error;
-  return {
-    deleted: true,
-    reason: "deleted_non_web_row"
-  };
-}
-async function getProfileByUserId(db, userId) {
-  const { data, error } = await db.from("profiles").select("user_id, stripe_customer_id, email, full_name, phone").eq("user_id", userId).maybeSingle();
-  if (error) throw error;
-  return data ?? null;
-}
-// ---------------------------------------------------------------------------
-// Stripe helpers
-// ---------------------------------------------------------------------------
-async function stripeFetch(path, init = {}) {
-  const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY");
-  if (!STRIPE_SECRET_KEY) {
-    throw new Error("STRIPE_SECRET_KEY not set");
-  }
-  const headers = new Headers(init.headers || {});
-  headers.set("Authorization", `Bearer ${STRIPE_SECRET_KEY}`);
-  const method = (init.method || "GET").toUpperCase();
-  if (method !== "GET") {
-    headers.set("Content-Type", "application/x-www-form-urlencoded");
-  }
-  const res = await fetch(`https://api.stripe.com${path}`, {
-    ...init,
-    headers
-  });
-  return res;
-}
-async function stripeListCustomerSubscriptions(customerId) {
-  const url = `/v1/subscriptions?customer=${encodeURIComponent(customerId)}&status=all&limit=100`;
-  const res = await stripeFetch(url, {
-    method: "GET"
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`stripeListCustomerSubscriptions failed: ${res.status} ${text}`);
-  }
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed?.data) ? parsed.data : [];
-  } catch  {
-    throw new Error("stripeListCustomerSubscriptions returned invalid JSON");
-  }
-}
-async function stripeCancelSubscription(subId) {
-  const res = await stripeFetch(`/v1/subscriptions/${encodeURIComponent(subId)}`, {
-    method: "DELETE"
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`stripeCancelSubscription failed for ${subId}: ${res.status} ${text}`);
-  }
-  try {
-    return JSON.parse(text);
-  } catch  {
-    return null;
-  }
-}
-async function cancelStripeSubscriptionsForUser(db, userId, reason) {
-  const profile = await getProfileByUserId(db, userId);
-  const customerId = String(profile?.stripe_customer_id || "").trim();
-  if (!customerId) {
-    console.log(`[RC-webhook-v4] no stripe_customer_id for user=${userId}, skipping Stripe cancel reason=${reason}`);
-    return {
-      ok: true,
-      cancelled: [],
-      reason: "no_customer_id"
-    };
-  }
-  const subs = await stripeListCustomerSubscriptions(customerId);
-  const actionableStatuses = new Set([
-    "trialing",
-    "active",
-    "past_due",
-    "unpaid",
-    "incomplete"
-  ]);
-  const cancelled = [];
-  for (const sub of subs){
-    const subId = String(sub?.id || "").trim();
-    const status = String(sub?.status || "").trim().toLowerCase();
-    if (!subId) continue;
-    if (!actionableStatuses.has(status)) continue;
-    try {
-      await stripeCancelSubscription(subId);
-      cancelled.push(subId);
-      console.log(`[RC-webhook-v4] cancelled Stripe subscription sub_id=${subId} customer=${customerId} user=${userId} reason=${reason}`);
-    } catch (err) {
-      console.error(`[RC-webhook-v4] failed to cancel Stripe subscription sub_id=${subId} customer=${customerId} user=${userId} reason=${reason}:`, err);
-    }
-  }
-  return {
-    ok: true,
-    cancelled,
-    reason: cancelled.length ? "cancelled_matching_subscriptions" : "no_actionable_subscriptions"
-  };
-}
+
 // ---------------------------------------------------------------------------
 // Plaid disconnect — mirrors hutsy_plaid_disconnect_for_user() in PHP
+// Copied pattern from stripe-webhook/index.ts
 // ---------------------------------------------------------------------------
-function buildPlaidClient(plaidEnv) {
-  const PLAID_CLIENT_ID = Deno.env.get("PLAID_CLIENT_ID");
-  const PLAID_SECRET = Deno.env.get("PLAID_SECRET");
-  if (!PLAID_CLIENT_ID || !PLAID_SECRET) throw new Error("Missing Plaid credentials");
+
+function buildPlaidClient(plaidEnv: string) {
+  const PLAID_CLIENT_ID = Deno.env.get('PLAID_CLIENT_ID');
+  const PLAID_SECRET    = Deno.env.get('PLAID_SECRET');
+  if (!PLAID_CLIENT_ID || !PLAID_SECRET) throw new Error('Missing Plaid credentials');
   return new PlaidApi(new Configuration({
     basePath: PlaidEnvironments[plaidEnv] ?? PlaidEnvironments.sandbox,
     baseOptions: {
       headers: {
-        "PLAID-CLIENT-ID": PLAID_CLIENT_ID,
-        "PLAID-SECRET": PLAID_SECRET
-      }
-    }
+        'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
+        'PLAID-SECRET':    PLAID_SECRET,
+      },
+    },
   }));
 }
-function extractPlaidError(err) {
-  const e = err;
+
+interface PlaidErrorData { error_code?: string; error_message?: string; display_message?: string; }
+interface PlaidSdkError { response?: { data?: PlaidErrorData; status?: number } }
+
+function extractPlaidError(err: unknown): PlaidErrorData & { status?: number } {
+  const e = err as PlaidSdkError;
   return {
-    error_code: e?.response?.data?.error_code,
-    error_message: e?.response?.data?.error_message,
+    error_code:      e?.response?.data?.error_code,
+    error_message:   e?.response?.data?.error_message,
     display_message: e?.response?.data?.display_message,
-    status: e?.response?.status
+    status:          e?.response?.status,
   };
 }
-async function plaidCallItemGet(plaid, accessToken) {
+
+async function plaidCallItemGet(plaid: PlaidApi, accessToken: string): Promise<{ ok: boolean; errorCode: string | null }> {
   try {
-    const res = await plaid.itemGet({
-      access_token: accessToken
-    });
-    return res.data?.item ? {
-      ok: true,
-      errorCode: null
-    } : {
-      ok: false,
-      errorCode: "unknown"
-    };
-  } catch (err) {
+    const res = await plaid.itemGet({ access_token: accessToken });
+    return res.data?.item ? { ok: true, errorCode: null } : { ok: false, errorCode: 'unknown' };
+  } catch (err: unknown) {
     const { error_code, error_message } = extractPlaidError(err);
     console.error(`[RC-webhook] plaidCallItemGet: error_code=${error_code} error_message=${error_message}`);
-    return {
-      ok: false,
-      errorCode: error_code ?? "unknown"
-    };
+    return { ok: false, errorCode: error_code ?? 'unknown' };
   }
 }
-async function plaidCallItemRemove(plaid, accessToken) {
-  console.log("[RC-webhook] plaidCallItemRemove: calling /item/remove");
+
+async function plaidCallItemRemove(plaid: PlaidApi, accessToken: string): Promise<{ ok: boolean; errorCode: string | null }> {
+  console.log('[RC-webhook] plaidCallItemRemove: calling /item/remove');
   try {
-    const res = await plaid.itemRemove({
-      access_token: accessToken
-    });
-    const removed = res.data?.removed;
+    const res = await plaid.itemRemove({ access_token: accessToken });
+    // SDK type doesn't declare `removed`; cast to access it
+    const removed = (res.data as { removed?: boolean })?.removed;
     if (removed) {
-      console.log("[RC-webhook] plaidCallItemRemove: success, item removed");
-      return {
-        ok: true,
-        errorCode: null
-      };
+      console.log('[RC-webhook] plaidCallItemRemove: success, item removed');
+      return { ok: true, errorCode: null };
     }
-    console.warn("[RC-webhook] plaidCallItemRemove: unexpected response (no removed flag)", JSON.stringify(res.data));
-    return {
-      ok: false,
-      errorCode: "unexpected_response"
-    };
-  } catch (err) {
+    console.warn('[RC-webhook] plaidCallItemRemove: unexpected response (no removed flag)', JSON.stringify(res.data));
+    return { ok: false, errorCode: 'unexpected_response' };
+  } catch (err: unknown) {
     const { error_code, error_message, display_message, status } = extractPlaidError(err);
-    const errCode = error_code ?? "";
+    const errCode = error_code ?? '';
     console.error(`[RC-webhook] plaidCallItemRemove: status=${status} error_code=${errCode} error_message=${error_message} display_message=${display_message}`);
-    if (errCode === "ITEM_NOT_FOUND") {
-      console.log("[RC-webhook] plaidCallItemRemove: ITEM_NOT_FOUND — treating as already removed");
-      return {
-        ok: true,
-        errorCode: "ITEM_NOT_FOUND"
-      };
+    if (errCode === 'ITEM_NOT_FOUND') {
+      console.log('[RC-webhook] plaidCallItemRemove: ITEM_NOT_FOUND — treating as already removed');
+      return { ok: true, errorCode: 'ITEM_NOT_FOUND' };
     }
-    if (errCode) return {
-      ok: false,
-      errorCode: errCode
-    };
-    console.warn("[RC-webhook] plaidCallItemRemove: ambiguous error, verifying via itemGet");
+    if (errCode) return { ok: false, errorCode: errCode };
+    // Ambiguous error — verify via itemGet
+    console.warn('[RC-webhook] plaidCallItemRemove: ambiguous error, verifying via itemGet');
     const check = await plaidCallItemGet(plaid, accessToken);
-    if (!check.ok && check.errorCode === "ITEM_NOT_FOUND") {
-      console.log("[RC-webhook] plaidCallItemRemove: itemGet confirmed item gone — treating as removed");
-      return {
-        ok: true,
-        errorCode: "ALREADY_REMOVED"
-      };
+    if (!check.ok && check.errorCode === 'ITEM_NOT_FOUND') {
+      console.log('[RC-webhook] plaidCallItemRemove: itemGet confirmed item gone — treating as removed');
+      return { ok: true, errorCode: 'ALREADY_REMOVED' };
     }
-    console.error("[RC-webhook] plaidCallItemRemove: item still exists or unknown error after verification");
-    return {
-      ok: false,
-      errorCode: "unexpected_response"
-    };
+    console.error('[RC-webhook] plaidCallItemRemove: item still exists or unknown error after verification');
+    return { ok: false, errorCode: 'unexpected_response' };
   }
 }
-async function purgePlaidSupabaseItem(db, userId, itemId, env) {
-  const match = {
-    item_id: itemId,
-    user_id: userId,
-    plaid_env: env
-  };
-  await db.from("plaid_transactions").delete().match(match);
-  await db.from("plaid_recurring").delete().match(match);
-  await db.from("plaid_accounts").delete().match(match);
-  await db.from("plaid_webhook_events").delete().match(match);
-  await db.from("plaid_item_secrets").delete().match(match);
-  await db.from("plaid_items").delete().match(match);
+
+async function purgePlaidSupabaseItem(db: ReturnType<typeof createClient>, userId: string, itemId: string, env: string) {
+  const match = { item_id: itemId, user_id: userId, plaid_env: env };
+  await db.from('plaid_transactions').delete().match(match);
+  await db.from('plaid_recurring').delete().match(match);
+  await db.from('plaid_accounts').delete().match(match);
+  await db.from('plaid_webhook_events').delete().match(match);
+  await db.from('plaid_item_secrets').delete().match(match);
+  await db.from('plaid_items').delete().match(match);
 }
-async function disconnectPlaidForUser(db, userId, reason) {
+
+/**
+ * Full Plaid disconnect for a user.
+ * - Calls Plaid /item/remove for each item to stop billing.
+ * - On success (or ITEM_NOT_FOUND), purges all related Supabase rows.
+ * - Always stamps profiles.bank_disconnected_at.
+ */
+async function disconnectPlaidForUser(db: ReturnType<typeof createClient>, userId: string, reason: string) {
   if (!userId) return;
-  const env = (Deno.env.get("PLAID_ENV") ?? "production").toLowerCase();
-  const { data: secrets, error: secsErr } = await db.from("plaid_item_secrets").select("item_id, access_token").eq("user_id", userId).eq("plaid_env", env);
-  if (secsErr) {
-    console.error("[RC-webhook-v4] plaid_item_secrets fetch error:", secsErr);
-  }
+
+  const env = (Deno.env.get('PLAID_ENV') ?? 'production').toLowerCase();
+
+  const { data: secrets, error: secsErr } = await db
+    .from('plaid_item_secrets')
+    .select('item_id, access_token')
+    .eq('user_id', userId)
+    .eq('plaid_env', env);
+
+  if (secsErr) console.error('[RC-webhook-v2] plaid_item_secrets fetch error:', secsErr);
+
   if (!secrets?.length) {
-    console.log(`[RC-webhook-v4] no plaid items for user=${userId}, marking disconnected anyway`);
-    await db.from("profiles").update({
-      bank_disconnected_at: new Date().toISOString()
-    }).eq("user_id", userId);
+    console.log(`[RC-webhook-v2] no plaid items for user=${userId}, marking disconnected anyway`);
+    //@ts-ignore //TODO add comment
+    await db.from('profiles').update({ bank_disconnected_at: new Date().toISOString() }).eq('user_id', userId);
     return;
   }
+
   const plaid = buildPlaidClient(env);
-  for (const { item_id: itemId, access_token: token } of secrets){
+
+  for (const { item_id: itemId, access_token: token } of secrets) {
     if (!itemId || !token) continue;
+
     const { ok, errorCode } = await plaidCallItemRemove(plaid, token);
-    const effectivelyRemoved = ok || errorCode === "ITEM_NOT_FOUND" || errorCode === "ALREADY_REMOVED";
+    const effectivelyRemoved = ok || errorCode === 'ITEM_NOT_FOUND' || errorCode === 'ALREADY_REMOVED';
+
     if (effectivelyRemoved) {
       await purgePlaidSupabaseItem(db, userId, itemId, env);
-      console.log(`[RC-webhook-v4] plaid item purged item=${itemId} user=${userId} reason=${reason}`);
+      console.log(`[RC-webhook-v2] plaid item purged item=${itemId} user=${userId} reason=${reason}`);
     } else {
-      console.error(`[RC-webhook-v4] plaid /item/remove failed item=${itemId} user=${userId} error=${errorCode}`);
+      console.error(`[RC-webhook-v2] plaid /item/remove failed item=${itemId} user=${userId} error=${errorCode}`);
     }
   }
-  await db.from("profiles").update({
-    bank_disconnected_at: new Date().toISOString()
-  }).eq("user_id", userId);
+
+  //@ts-ignore //TODO add comment
+  await db.from('profiles').update({ bank_disconnected_at: new Date().toISOString() }).eq('user_id', userId);
 }
-// ---------------------------------------------------------------------------
-// Transfer handler
-// ---------------------------------------------------------------------------
-async function handleTransferEvent(db, event) {
-  const fromUserId = pickRealAppUserId(event.transferred_from);
-  const toUserId = pickRealAppUserId(event.transferred_to);
-  console.log(`[RC-webhook-v4] TRANSFER detected from=${fromUserId} to=${toUserId} store=${String(event.store || "")}`);
-  if (!toUserId) {
-    console.warn("[RC-webhook-v4] TRANSFER has no real transferred_to app user id, ignoring");
-    return json({
-      ok: true,
-      ignored: true,
-      reason: "transfer_missing_to_user",
-      from_user_id: fromUserId,
-      to_user_id: toUserId
-    });
-  }
-  const source = mapSource(String(event.store || ""));
-  const targetRow = await getSubscriptionRowByUserId(db, toUserId);
-  // Important:
-  // after transfer, this row must become RC-owned so Stripe webhook
-  // will ignore later Stripe cancellation events.
-  const forcedRcId = `rc_${toUserId}`;
-  const payload = {
-    plan: String(targetRow?.plan || "credit_builder"),
-    interval: targetRow?.interval ?? "month",
-    stripe_status: "active",
-    source,
-    next_renewal: targetRow?.next_renewal ?? null,
-    force_id: forcedRcId
-  };
-  const upserted = await upsertSubscriptionRowByUserId(db, toUserId, payload);
-  await cancelStripeSubscriptionsForUser(db, toUserId, "revenuecat:TRANSFER");
-  let transferredFromCleanup = {
-    deleted: false,
-    reason: "no_from_user"
-  };
-  if (fromUserId && fromUserId !== toUserId) {
-    try {
-      transferredFromCleanup = await deleteOldTransferredNonWebRow(db, fromUserId);
-    } catch (err) {
-      console.error(`[RC-webhook-v4] failed cleaning transferred_from row user=${fromUserId}:`, err);
-      transferredFromCleanup = {
-        deleted: false,
-        reason: "cleanup_failed"
-      };
-    }
-  }
-  console.log(`[RC-webhook-v4] TRANSFER handled to=${toUserId} action=${upserted.action} id=${upserted.id} from_cleanup=${JSON.stringify(transferredFromCleanup)}`);
-  return json({
-    ok: true,
-    action: "transfer_handled",
-    transferred_from_user_id: fromUserId,
-    transferred_to_user_id: toUserId,
-    target_subscription_action: upserted.action,
-    target_subscription_id: upserted.id,
-    source,
-    old_row_cleanup: transferredFromCleanup
-  });
-}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-Deno.serve(async (req)=>{
+Deno.serve(async (req) => {
   try {
-    if (req.method !== "POST") {
-      return json({
-        ok: false,
-        error: "method_not_allowed"
-      }, 405);
+    if (req.method !== 'POST') {
+      return json({ ok: false, error: 'method_not_allowed' }, 405);
     }
-    const body = await req.json().catch(()=>null);
-    console.log("[RC-webhook-v4] raw body:", JSON.stringify(body));
+
+    const body = await req.json().catch(() => null);
+    console.log('[RC-webhook-v2] raw body:', JSON.stringify(body));
     const event = body?.event;
     if (!event) {
-      console.error("[RC-webhook-v4] missing event", body);
-      return json({
-        ok: false,
-        error: "missing_event"
-      }, 400);
+      console.error('[RC-webhook-v2] missing event', body);
+      return json({ ok: false, error: 'missing_event' }, 400);
     }
-    const eventType = String(event.type || "").toUpperCase().trim();
-    if (eventType === "TEST") {
-      console.log("[RC-webhook-v4] test event received");
-      return json({
-        ok: true,
-        ignored: true,
-        reason: "test_event"
-      });
-    }
-    const db = buildAdminClient();
-    // ---------------------------------------------------------------------
-    // TRANSFER events do not reliably include event.app_user_id
-    // Handle them before the normal app_user_id flow.
-    // ---------------------------------------------------------------------
-    if (eventType === "TRANSFER") {
-      return await handleTransferEvent(db, event);
-    }
-    const userId = String(event.app_user_id || "").trim();
+
+    const userId = (event.app_user_id || '').trim();
     if (!userId) {
-      console.error("[RC-webhook-v4] missing app_user_id", event);
-      return json({
-        ok: false,
-        error: "missing_app_user_id"
-      }, 400);
+      console.error('[RC-webhook-v2] missing app_user_id', event);
+      return json({ ok: false, error: 'missing_app_user_id' }, 400);
     }
-    const { plan, interval } = mapPlan(String(event.product_id || ""));
-    const source = mapSource(String(event.store || ""));
-    const stripeStatus = mapStatus(eventType, event.expiration_at_ms ?? null);
-    const nextRenewal = event.expiration_at_ms ? new Date(event.expiration_at_ms).toISOString() : null;
-    const isPaid = [
-      "active",
-      "trialing"
-    ].includes(stripeStatus);
-    console.log(`[RC-webhook-v4] user_id=${userId} type=${eventType} product_id=${String(event.product_id || "")} store=${String(event.store || "")} status=${stripeStatus}`);
-    const payload = {
+
+    const eventType = (event.type || '').toUpperCase().trim();
+
+    if (eventType === 'TEST') {
+      console.log('[RC-webhook-v2] test event received');
+      return json({ ok: true, ignored: true, reason: 'test_event' });
+    }
+
+    const db = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+    );
+
+    const { plan, interval } = mapPlan(event.product_id);
+    const source       = mapSource(event.store);
+    const stripeStatus = mapStatus(event.type, event.expiration_at_ms ?? null);
+    const nextRenewal  = event.expiration_at_ms ? new Date(event.expiration_at_ms).toISOString() : null;
+    const syntheticId  = `rc_${userId}`;
+    const isPaid       = ['active', 'trialing'].includes(stripeStatus);
+
+    console.log(`[RC-webhook-v2] user_id=${userId} type=${eventType} product_id=${event.product_id} store=${event.store} status=${stripeStatus}`);
+
+    const { data: existingRow, error: existingError } = await db
+      .from('subscriptions')
+      .select('id, user_id')
+      .eq('id', syntheticId)
+      .maybeSingle();
+
+    if (existingError) {
+      console.error('[RC-webhook-v2] existing row lookup failed:', existingError);
+      return json({ ok: false, error: 'existing_lookup_failed', details: existingError.message }, 500);
+    }
+
+    if (existingRow) {
+      const updatePayload: Record<string, unknown> = {
+        plan,
+        interval,
+        stripe_status: stripeStatus,
+        source,
+        updated_at: new Date().toISOString(),
+      };
+      if (nextRenewal) {
+        updatePayload['next_renewal'] = nextRenewal;
+      } else if (stripeStatus === 'expired' || stripeStatus === 'cancelled' || stripeStatus === 'past_due') {
+        updatePayload['next_renewal'] = null;
+      }
+
+      const { error: updateError } = await db.from('subscriptions').update(updatePayload).eq('id', syntheticId);
+      if (updateError) {
+        console.error('[RC-webhook-v2] update failed:', updateError);
+        return json({ ok: false, error: 'update_failed', details: updateError.message }, 500);
+      }
+
+      //@ts-ignore //TODO add comment
+      if (!isPaid) await disconnectPlaidForUser(db, userId, `revenuecat:${eventType}`);
+
+      console.log(`[RC-webhook-v2] updated existing subscription id=${existingRow.id} user_id=${userId}`);
+      return json({ ok: true, action: 'updated', user_id: userId, id: existingRow.id, stripe_status: stripeStatus, source });
+    }
+
+    const { error: insertError } = await db.from('subscriptions').insert({
+      id: syntheticId,
+      user_id: userId,
       plan,
       interval,
       stripe_status: stripeStatus,
-      source
-    };
-    if (nextRenewal) {
-      payload.next_renewal = nextRenewal;
-    } else if (stripeStatus === "expired" || stripeStatus === "cancelled" || stripeStatus === "past_due") {
-      payload.next_renewal = null;
-    }
-    // Keep non-web subscriptions normalized to rc_<user_id>
-    if (isNonWebSource(source)) {
-      payload.force_id = `rc_${userId}`;
-    }
-    const result = await upsertSubscriptionRowByUserId(db, userId, payload);
-    if (!isPaid) {
-      await disconnectPlaidForUser(db, userId, `revenuecat:${eventType}`);
-    }
-    console.log(`[RC-webhook-v4] ${result.action} subscription row id=${result.id} user_id=${userId} source=${source} status=${stripeStatus}`);
-    return json({
-      ok: true,
-      action: result.action,
-      user_id: userId,
-      id: result.id,
-      stripe_status: stripeStatus,
-      source
+      next_renewal: nextRenewal,
+      source,
     });
+
+    if (insertError) {
+      console.error('[RC-webhook-v2] insert failed:', insertError);
+      return json({ ok: false, error: 'insert_failed', details: insertError.message }, 500);
+    }
+
+    //@ts-ignore //TODO add comment
+    if (!isPaid) await disconnectPlaidForUser(db, userId, `revenuecat:${eventType}`);
+
+    console.log(`[RC-webhook-v2] inserted new subscription id=${syntheticId} user_id=${userId}`);
+    return json({ ok: true, action: 'inserted', user_id: userId, id: syntheticId, stripe_status: stripeStatus, source });
+
   } catch (e) {
-    console.error("[RC-webhook-v4] fatal error:", e);
-    return json({
-      ok: false,
-      error: e instanceof Error ? e.message : "unknown_error"
-    }, 500);
+    console.error('[RC-webhook-v2] fatal error:', e);
+    return json({ ok: false, error: e instanceof Error ? e.message : 'unknown_error' }, 500);
   }
 });

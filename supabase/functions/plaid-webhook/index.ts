@@ -31,6 +31,7 @@ function dedupeOk(key) {
 function buildAdminClient() {
   return createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '');
 }
+
 function buildPlaidClient(plaidEnv) {
   const PLAID_CLIENT_ID = Deno.env.get('PLAID_CLIENT_ID');
   const PLAID_SECRET = Deno.env.get('PLAID_SECRET');

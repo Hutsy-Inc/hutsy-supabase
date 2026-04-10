@@ -1,6 +1,6 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
-import { Configuration, PlaidApi, PlaidEnvironments } from "npm:plaid";
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from '@supabase/supabase-js';
+import { Configuration, PlaidApi, PlaidEnvironments } from 'plaid';
 // ---------------------------------------------------------------------------
 // Stripe webhook signature verification
 // ---------------------------------------------------------------------------
@@ -42,48 +42,20 @@ async function sbGetProfileByCustomer(db, stripeCustomerId) {
   const { data } = await db.from('profiles').select('user_id, email, full_name, phone').eq('stripe_customer_id', stripeCustomerId).limit(1);
   return data?.[0] ?? null;
 }
-async function sbGetSubscriptionByUserId(db, userId) {
-  const { data, error } = await db.from('subscriptions').select('id, user_id, source, stripe_status, plan, interval, next_renewal').eq('user_id', userId).maybeSingle();
-  if (error) {
-    console.error('[stripe-webhook] sbGetSubscriptionByUserId error:', error);
-    return null;
-  }
-  return data ?? null;
-}
-function isNonWebOwnedRow(row) {
-  if (!row) return false;
-  const source = String(row.source || '').trim().toLowerCase();
-  const rowId = String(row.id || '').trim();
-  return source === 'ios' || source === 'android' || source === 'revenuecat' || source === 'test' || rowId.startsWith('rc_');
-}
-async function shouldIgnoreStripeForUser(db, userId) {
-  const row = await sbGetSubscriptionByUserId(db, userId);
-  return isNonWebOwnedRow(row);
-}
 async function sbUpsertSubscription(db, subId, userId, plan, interval, status, nextRenewal) {
-  const existing = await sbGetSubscriptionByUserId(db, userId);
-  // Important:
-  // If this user is already owned by RevenueCat / mobile, Stripe must not overwrite it.
-  if (isNonWebOwnedRow(existing)) {
-    console.log(`[stripe-webhook] skip subscription upsert for user=${userId} sub_id=${subId} because row is non-web owned id=${existing?.id} source=${existing?.source}`);
-    return;
-  }
   const row = {
     id: subId,
     user_id: userId,
     plan,
     interval,
     stripe_status: status,
-    source: 'web',
     updated_at: new Date().toISOString()
   };
   if (nextRenewal !== null) row['next_renewal'] = nextRenewal;
   const { error } = await db.from('subscriptions').upsert(row, {
     onConflict: 'id'
   });
-  if (error) {
-    console.error('[stripe-webhook] sbUpsertSubscription error:', error);
-  }
+  if (error) console.error('[stripe-webhook] sbUpsertSubscription error:', error);
 }
 async function sbInsertPayment(db, id, userId, amount, currency, status, raw) {
   const { error } = await db.from('payments').insert({
@@ -102,81 +74,58 @@ async function sbInsertPayment(db, id, userId, amount, currency, status, raw) {
 // ---------------------------------------------------------------------------
 // Plaid disconnect — mirrors hutsy_plaid_disconnect_for_user() in PHP
 // ---------------------------------------------------------------------------
-function buildPlaidClient(plaidEnv) {
+
+// Copied from plaid-webhook/index.ts
+function buildPlaidClient(plaidEnv: string) {
   const PLAID_CLIENT_ID = Deno.env.get('PLAID_CLIENT_ID');
-  const PLAID_SECRET = Deno.env.get('PLAID_SECRET');
+  const PLAID_SECRET    = Deno.env.get('PLAID_SECRET');
   if (!PLAID_CLIENT_ID || !PLAID_SECRET) throw new Error('Missing Plaid credentials');
   return new PlaidApi(new Configuration({
     basePath: PlaidEnvironments[plaidEnv] ?? PlaidEnvironments.sandbox,
     baseOptions: {
       headers: {
         'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
-        'PLAID-SECRET': PLAID_SECRET
-      }
-    }
+        'PLAID-SECRET':    PLAID_SECRET,
+      },
+    },
   }));
 }
-async function plaidCallItemGet(plaid, accessToken) {
+
+/** Verify whether a Plaid item still exists via the SDK. */
+async function plaidCallItemGet(plaid: PlaidApi, accessToken: string): Promise<{ ok: boolean; errorCode: string | null }> {
   try {
-    const res = await plaid.itemGet({
-      access_token: accessToken
-    });
-    return res.data?.item ? {
-      ok: true,
-      errorCode: null
-    } : {
-      ok: false,
-      errorCode: 'unknown'
-    };
-  } catch (err) {
+    const res = await plaid.itemGet({ access_token: accessToken });
+    return res.data?.item ? { ok: true, errorCode: null } : { ok: false, errorCode: 'unknown' };
+  } catch (err: any) {
     const code = err?.response?.data?.error_code ?? 'unknown';
-    return {
-      ok: false,
-      errorCode: code
-    };
+    return { ok: false, errorCode: code };
   }
 }
-async function plaidCallItemRemove(plaid, accessToken) {
+
+/** Remove a Plaid item via the SDK, with ITEM_NOT_FOUND treated as success. */
+async function plaidCallItemRemove(plaid: PlaidApi, accessToken: string): Promise<{ ok: boolean; errorCode: string | null }> {
   try {
-    const res = await plaid.itemRemove({
-      access_token: accessToken
-    });
-    return res.data?.removed ? {
-      ok: true,
-      errorCode: null
-    } : {
-      ok: false,
-      errorCode: 'unexpected_response'
-    };
-  } catch (err) {
-    const errCode = err?.response?.data?.error_code ?? '';
-    if (errCode === 'ITEM_NOT_FOUND') return {
-      ok: true,
-      errorCode: 'ITEM_NOT_FOUND'
-    };
-    if (errCode) return {
-      ok: false,
-      errorCode: errCode
-    };
+    const res = await plaid.itemRemove({ access_token: accessToken });
+    // SDK type doesn't declare `removed`; cast to access it
+    return (res.data as any)?.removed ? { ok: true, errorCode: null } : { ok: false, errorCode: 'unexpected_response' };
+  } catch (err: any) {
+    const errCode: string = err?.response?.data?.error_code ?? '';
+    // ITEM_NOT_FOUND means it's already gone — treat as success
+    if (errCode === 'ITEM_NOT_FOUND') return { ok: true, errorCode: 'ITEM_NOT_FOUND' };
+    if (errCode) return { ok: false, errorCode: errCode };
+
+    // Ambiguous error — verify via itemGet
     const check = await plaidCallItemGet(plaid, accessToken);
     if (!check.ok && check.errorCode === 'ITEM_NOT_FOUND') {
-      return {
-        ok: true,
-        errorCode: 'ALREADY_REMOVED'
-      };
+      return { ok: true, errorCode: 'ALREADY_REMOVED' };
     }
-    return {
-      ok: false,
-      errorCode: 'unexpected_response'
-    };
+    return { ok: false, errorCode: 'unexpected_response' };
   }
 }
-async function purgePlaidSupabaseItem(db, userId, itemId, env) {
-  const match = {
-    item_id: itemId,
-    user_id: userId,
-    plaid_env: env
-  };
+
+/** Delete all Supabase Plaid rows for one item (leaf tables first, then secrets + item). */
+async function purgePlaidSupabaseItem(db, userId: string, itemId: string, env: string) {
+  const match = { item_id: itemId, user_id: userId, plaid_env: env };
   await db.from('plaid_transactions').delete().match(match);
   await db.from('plaid_recurring').delete().match(match);
   await db.from('plaid_accounts').delete().match(match);
@@ -184,23 +133,42 @@ async function purgePlaidSupabaseItem(db, userId, itemId, env) {
   await db.from('plaid_item_secrets').delete().match(match);
   await db.from('plaid_items').delete().match(match);
 }
-async function disconnectPlaidForUser(db, userId, reason) {
+
+/**
+ * Full Plaid disconnect for a user — mirrors hutsy_plaid_disconnect_for_user() in PHP.
+ * - Only runs in production (sandbox is skipped to avoid nuking test data).
+ * - Calls Plaid /item/remove for each item to stop billing.
+ * - On success (or ITEM_NOT_FOUND), purges all related Supabase rows.
+ * - Always stamps profiles.bank_disconnected_at regardless of item count.
+ */
+async function disconnectPlaidForUser(db, userId: string, reason: string) {
   if (!userId) return;
+
   const env = (Deno.env.get('PLAID_ENV') ?? 'production').toLowerCase();
-  const { data: secrets, error: secsErr } = await db.from('plaid_item_secrets').select('item_id, access_token').eq('user_id', userId).eq('plaid_env', env);
+
+  // Fetch all item secrets for this user
+  const { data: secrets, error: secsErr } = await db
+    .from('plaid_item_secrets')
+    .select('item_id, access_token')
+    .eq('user_id', userId)
+    .eq('plaid_env', env);
+
   if (secsErr) console.error('[stripe-webhook] plaid_item_secrets fetch error:', secsErr);
+
   if (!secrets?.length) {
     console.log(`[stripe-webhook] no plaid items found for user=${userId}, marking disconnected anyway`);
-    await db.from('profiles').update({
-      bank_disconnected_at: new Date().toISOString()
-    }).eq('user_id', userId);
+    await db.from('profiles').update({ bank_disconnected_at: new Date().toISOString() }).eq('user_id', userId);
     return;
   }
+
   const plaid = buildPlaidClient(env);
-  for (const { item_id: itemId, access_token: token } of secrets){
+
+  for (const { item_id: itemId, access_token: token } of secrets) {
     if (!itemId || !token) continue;
+
     const { ok, errorCode } = await plaidCallItemRemove(plaid, token);
     const effectivelyRemoved = ok || errorCode === 'ITEM_NOT_FOUND' || errorCode === 'ALREADY_REMOVED';
+
     if (effectivelyRemoved) {
       await purgePlaidSupabaseItem(db, userId, itemId, env);
       console.log(`[stripe-webhook] plaid item purged item=${itemId} user=${userId} reason=${reason}`);
@@ -208,12 +176,13 @@ async function disconnectPlaidForUser(db, userId, reason) {
       console.error(`[stripe-webhook] plaid /item/remove failed item=${itemId} user=${userId} error=${errorCode}`);
     }
   }
-  await db.from('profiles').update({
-    bank_disconnected_at: new Date().toISOString()
-  }).eq('user_id', userId);
+
+  // Always mark disconnected after the attempt
+  await db.from('profiles').update({ bank_disconnected_at: new Date().toISOString() }).eq('user_id', userId);
 }
 // ---------------------------------------------------------------------------
 // FCM push notifications (HTTP v1 API with service account JWT)
+// Mirrors hutsy/push/fcm.py
 // ---------------------------------------------------------------------------
 function base64urlEncode(data) {
   return btoa(String.fromCharCode(...data)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
@@ -330,6 +299,7 @@ async function pushToUser(db, userId, title, body, data = {}) {
 }
 // ---------------------------------------------------------------------------
 // Chat message storage
+// Mirrors hutsy/chat/logging.py — only inserts when chat_logging is enabled
 // ---------------------------------------------------------------------------
 async function storeChatMessage(db, userId, body, data) {
   const { data: rows } = await db.from('admin_settings').select('value').eq('key', 'chat_logging').limit(1);
@@ -354,6 +324,7 @@ async function storeChatMessage(db, userId, body, data) {
 }
 // ---------------------------------------------------------------------------
 // Subscription notification
+// Mirrors the notification logic from hutsy/webhooks/subscription.py
 // ---------------------------------------------------------------------------
 async function handleSubscriptionNotification(db, userId, status, amount, currency) {
   if (status === 'trialing') {
@@ -361,6 +332,7 @@ async function handleSubscriptionNotification(db, userId, status, amount, curren
     return;
   }
   if (status === 'active') {
+    // Dedup: only notify once per active period
     const { data: prof } = await db.from('profiles').select('sub_active_notified_at').eq('user_id', userId).limit(1);
     if (prof?.[0]?.sub_active_notified_at) {
       console.log(`[stripe-webhook] already notified user=${userId}, skipping`);
@@ -378,6 +350,7 @@ async function handleSubscriptionNotification(db, userId, status, amount, curren
       sub_active_notified_at: new Date().toISOString()
     }).eq('user_id', userId);
   } else {
+    // past_due, canceled, unpaid, etc.
     await db.from('profiles').update({
       sub_active_notified_at: null
     }).eq('user_id', userId);
@@ -442,35 +415,19 @@ async function handleSubscriptionEvent(db, sub) {
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
   if (!profile) return;
-  const userId = profile.user_id;
-  const shouldSkip = await shouldIgnoreStripeForUser(db, userId);
-  if (shouldSkip) {
-    console.log(`[stripe-webhook] skipping customer.subscription.* update for user=${userId} because subscription is non-web owned`);
-    return;
-  }
   const interval = getInterval(sub);
   const status = sub['status'] ?? 'unknown';
-  await sbUpsertSubscription(db, sub['id'], userId, 'credit_builder', interval, status, null);
-  const isPaidSub = [
-    'active',
-    'trialing'
-  ].includes(String(status).toLowerCase());
-  if (!isPaidSub) {
-    await disconnectPlaidForUser(db, userId, `customer.subscription.${status}`);
-  }
+  await sbUpsertSubscription(db, sub['id'], profile.user_id, 'credit_builder', interval, status, null);
+  const isPaidSub = ['active', 'trialing'].includes(status.toLowerCase());
+  if (!isPaidSub) await disconnectPlaidForUser(db, profile.user_id, `customer.subscription.${status}`);
 }
 async function handleInvoicePaymentSucceeded(db, inv) {
   const custId = inv['customer'];
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
   if (!profile) return;
-  const uid = profile.user_id;
-  const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
+  const { user_id: uid } = profile;
   await sbInsertPayment(db, inv['id'], uid, inv['amount_paid'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'paid', inv);
-  if (shouldSkip) {
-    console.log(`[stripe-webhook] skipping invoice.payment_succeeded subscription update for user=${uid} because subscription is non-web owned`);
-    return;
-  }
   const subId = getSubId(inv);
   if (!subId) return;
   const sub = await stripeRetrieveSubscription(subId);
@@ -488,13 +445,8 @@ async function handleInvoicePaymentFailed(db, inv) {
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
   if (!profile) return;
-  const uid = profile.user_id;
-  const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
+  const { user_id: uid } = profile;
   await sbInsertPayment(db, inv['id'], uid, inv['amount_due'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'open', inv);
-  if (shouldSkip) {
-    console.log(`[stripe-webhook] skipping invoice.payment_failed subscription update for user=${uid} because subscription is non-web owned`);
-    return;
-  }
   await disconnectPlaidForUser(db, uid, 'invoice.payment_failed');
   const amount = (inv['amount_due'] ?? 0) / 100;
   const currency = (inv['currency'] ?? 'usd').toUpperCase();
