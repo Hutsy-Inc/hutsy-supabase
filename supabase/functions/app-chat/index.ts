@@ -374,7 +374,7 @@ async function isBankConnected(db: any, userId: string): Promise<boolean> {
     .eq("user_id", userId);
   if (!items?.length) return false;
   for (const it of items) {
-    const st = ((it.status ?? it.connection_status) ?? "").toLowerCase();
+    const st = String(it.status || it.connection_status || "").toLowerCase();
     if (["connected", "active", "good"].includes(st)) return true;
   }
   return false;
