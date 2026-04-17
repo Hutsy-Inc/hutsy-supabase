@@ -112,7 +112,7 @@ Deno.serve(async (req)=>{
         Products.Auth
       ],
       country_codes: [
-        CountryCode.Us
+        CountryCode.Ca
       ],
       language: "en",
       webhook: webhookUrl
