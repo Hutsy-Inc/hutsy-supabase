@@ -143,11 +143,11 @@ async function isSubscriptionActive(db: any, userId: string): Promise<[boolean, 
 async function isBankConnected(db: any, userId: string): Promise<boolean> {
   const { data: items } = await db
     .from("plaid_items")
-    .select("status,connection_status")
+    .select("status")
     .eq("user_id", userId);
   if (!items?.length) return false;
   for (const it of items) {
-    const st = ((it.status ?? it.connection_status) ?? "").toLowerCase();
+    const st = String(it.status || "").toLowerCase();
     if (["connected", "active", "good"].includes(st)) return true;
   }
   return false;
@@ -543,16 +543,14 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
     return payload;
   }
 
-  // 2) Bank gate
+  // 2) Bank gate — never cache, always re-check on next request
   if (!(await isBankConnected(db, userId))) {
-    const payload = await payloadForGate(
+    return await payloadForGate(
       userId,
       "gate_bank",
       "Connect your bank",
       "Connect your bank to unlock balances, bills, and daily alerts.",
     );
-    await db.from("snapshot_current").upsert(payload, { onConflict: "user_id" });
-    return payload;
   }
 
   // 3) AI snapshot
@@ -655,21 +653,29 @@ async function handleSnapshotCurrent(db: any, userId: string): Promise<Response>
     .limit(1);
 
   const row = rows?.[0] ?? null;
-  if (row && isRowValidForToday(row)) {
+  const isGateRow = (r: any) => String(r?.category ?? "").startsWith("gate_");
+
+  // Serve cached row only if valid for today AND not a stale gate response
+  if (row && isRowValidForToday(row) && !isGateRow(row)) {
     return ok({ snapshot: ensureAskPrompt(row) });
   }
 
-  // Build + store today
-  await buildAndStoreToday(db, userId);
+  // Build today's snapshot (gate responses are no longer written to DB)
+  const payload = await buildAndStoreToday(db, userId);
 
-  // Re-read as source of truth
+  // If gate response, return it directly (no DB row to re-read)
+  if (isGateRow(payload)) {
+    return ok({ snapshot: ensureAskPrompt(payload) });
+  }
+
+  // Re-read real snapshot as source of truth
   const { data: rows2 } = await db
     .from("snapshot_current")
     .select("*")
     .eq("user_id", userId)
     .limit(1);
 
-  return ok({ snapshot: ensureAskPrompt(rows2?.[0] ?? {}) });
+  return ok({ snapshot: ensureAskPrompt(rows2?.[0] ?? payload) });
 }
 
 /**
