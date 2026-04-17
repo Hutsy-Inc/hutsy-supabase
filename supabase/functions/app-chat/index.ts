@@ -380,16 +380,6 @@ async function isBankConnected(db: any, userId: string): Promise<boolean> {
   return false;
 }
 
-// deno-lint-ignore no-explicit-any
-async function isCreditConnected(db: any, userId: string): Promise<boolean> {
-  const { data } = await db
-    .from("array_identities")
-    .select("user_id")
-    .eq("user_id", userId)
-    .limit(1);
-  return (data?.length ?? 0) > 0;
-}
-
 // ---------------------------------------------------------------------------
 // Snapshot builder — mirrors hutsy/snapshot/builder.py
 // ---------------------------------------------------------------------------
@@ -467,9 +457,6 @@ async function getSnapshot(db: any, userId: string) {
     { data: accounts },
     { data: txns },
     { data: recurring },
-    { data: finance },
-    { data: risk },
-    { data: creditRows },
   ] = await Promise.all([
     db.from("profiles").select("full_name,email").eq("user_id", userId).limit(
       1,
@@ -486,24 +473,6 @@ async function getSnapshot(db: any, userId: string) {
       .order("date_posted", { ascending: false })
       .limit(25),
     db.from("plaid_recurring").select("*").eq("user_id", userId),
-    db
-      .from("finance_snapshots")
-      .select("credit_score")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1),
-    db
-      .from("risk_summaries")
-      .select("band")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1),
-    db
-      .from("credit_reports")
-      .select("*")
-      .eq("user_id", userId)
-      .order("pulled_at", { ascending: false })
-      .limit(1),
   ]);
 
   const profile = profileRows?.[0] ?? null;
@@ -551,64 +520,8 @@ async function getSnapshot(db: any, userId: string) {
   const nextBill = outflows[0] ??
     { label: "Bill", amount: "0", next_date: "N/A" };
 
-  // Credit
-  let score: number | null = null;
-  let bucket: string | null = null;
-  let creditSource = "none";
-  // deno-lint-ignore no-explicit-any
-  let creditSummary: Record<string, any> | null = null;
-  let creditConnected = false;
-
-  if (creditRows?.[0]) {
-    const r = creditRows[0];
-    score = r.credit_score ?? null;
-    bucket = r.score_bucket ?? null;
-    creditSource = r.provider ?? "array";
-    creditSummary = parseJsonField(r.ai_summary) ?? {};
-
-    const add = (key: string, col: string) => {
-      if (!(key in creditSummary!) && r[col] != null) {
-        creditSummary![key] = r[col];
-      }
-    };
-    add("score", "credit_score");
-    add("bucket", "score_bucket");
-    add("total_tradelines", "total_tradelines");
-    add("open_tradelines", "open_tradelines");
-    add("closed_tradelines", "closed_tradelines");
-    add("avg_age_open_trades_months", "avg_age_open_trades_months");
-    add("oldest_trade_months", "oldest_trade_months");
-    add("revolving_utilization_pct", "revolving_utilization_pct");
-    add("total_revolving_limit", "total_revolving_limit");
-    add("total_revolving_balance", "total_revolving_balance");
-    add("open_to_buy", "open_to_buy");
-    add("hard_inquiries_6m", "hard_inquiries_6m");
-    add("hard_inquiries_12m", "hard_inquiries_12m");
-    add("hard_inquiries_24m", "hard_inquiries_24m");
-    add("last_inquiry_date", "last_inquiry_date");
-    add("collections", "collections_count");
-    add("public_records", "public_records_count");
-    add("bankruptcies", "bankruptcies_count");
-    add("past_due_total", "past_due_total");
-    add("monthly_payment_total", "monthly_payment_total");
-    if (!("reason_codes" in creditSummary!)) {
-      creditSummary!.reason_codes = parseJsonField(r.score_reasons) ?? null;
-    }
-    creditConnected = true;
-  } else {
-    if (finance?.[0]?.credit_score != null) {
-      score = finance[0].credit_score;
-      creditSource = "finance_snapshots";
-    }
-    if (risk?.[0]?.band && !bucket) {
-      bucket = risk[0].band;
-      if (creditSource === "none") creditSource = "risk_summaries";
-    }
-    creditConnected = score != null;
-  }
-
   const defaultCurrency = maskedAccounts.find((a) => a.currency)?.currency ??
-    "USD";
+    "CAD";
   const outgoingTotal = outflows.reduce(
     (acc, b) => acc + (parseFloat(String(b.amount ?? 0)) || 0),
     0,
@@ -622,13 +535,6 @@ async function getSnapshot(db: any, userId: string) {
     masked_accounts: maskedAccounts,
     transactions: maskedTx,
     recurring_outflows: outflows,
-    credit: {
-      score,
-      bucket,
-      source: creditSource,
-      summary: creditSummary,
-      connected: creditConnected,
-    },
     next_bill: nextBill,
     outgoing_total: outgoingTotal.toFixed(2),
     default_currency: defaultCurrency,
@@ -677,13 +583,6 @@ function hasBankData(snapshot: any): boolean {
 }
 
 // deno-lint-ignore no-explicit-any
-function hasCreditData(snapshot: any): boolean {
-  const c = snapshot.credit ?? {};
-  return c.connected === true ||
-    (c.summary && Object.keys(c.summary).length > 0) || c.score != null;
-}
-
-// deno-lint-ignore no-explicit-any
 function safeBankPayload(snapshot: any) {
   const ccy = snapshot.default_currency ?? "USD";
   return redactDeep({
@@ -720,31 +619,6 @@ function safeBankPayload(snapshot: any) {
     })),
     next_bill: snapshot.next_bill,
     outgoing_total: snapshot.outgoing_total,
-  });
-}
-
-// deno-lint-ignore no-explicit-any
-function safeCreditPayload(snapshot: any) {
-  const cs = snapshot.credit ?? {};
-  const summ = typeof cs.summary === "object" && cs.summary ? cs.summary : {};
-  return redactDeep({
-    connected: cs.connected ?? hasCreditData(snapshot),
-    score: cs.score,
-    bucket: cs.bucket,
-    source: cs.source,
-    utilization_pct: summ.revolving_utilization_pct ?? summ.utilization_pct,
-    total_revolving_limit: summ.total_revolving_limit ??
-      summ.total_open_credit_limit,
-    total_revolving_balance: summ.total_revolving_balance,
-    total_tradelines: summ.total_tradelines,
-    open_tradelines: summ.open_tradelines,
-    hard_inquiries_6m: summ.hard_inquiries_6m,
-    hard_inquiries_12m: summ.hard_inquiries_12m,
-    collections: summ.collections ?? summ.collections_count,
-    public_records: summ.public_records ?? summ.public_records_count,
-    past_due_total: summ.past_due_total,
-    monthly_payment_total: summ.monthly_payment_total,
-    reason_codes: summ.reason_codes,
   });
 }
 
@@ -895,23 +769,21 @@ async function agentPlan(
     `Conversation history:\n${history}`,
     `\nUser message:\n${userMsg}`,
     `\nSession context:\n${JSON.stringify({ mode })}`,
-    `\nReturn JSON:\n{\n  "needs": "bank" | "credit" | "both" | "none",`,
+    `\nReturn JSON:\n{\n  "needs": "bank" | "none",`,
     `  "task": "one short label",`,
     `  "focus_account_last4": "1234 or null",`,
     `  "clarifying_question": "string or null"\n}`,
     `\nRules:`,
     `- Infer needs from the user's intent.`,
     `- Choose "bank" if the request requires account/transaction/bill data.`,
-    `- Choose "credit" if the request requires credit score/report/limits/utilization/inquiries data.`,
-    `- Choose "both" if it truly needs both sources or intent is mixed.`,
     `- Choose "none" for general coaching not requiring any user data.`,
     `- Only ask clarifying_question if truly required (short).`,
   ].join("\n");
 
   const txt = await anthropicMessage(system, user, 240);
   const plan = jsonLooseParse(txt) ?? {};
-  if (!["bank", "credit", "both", "none"].includes(plan.needs as string)) {
-    plan.needs = "both";
+  if (!["bank", "none"].includes(plan.needs as string)) {
+    plan.needs = "bank";
   }
   plan.clarifying_question ??= null;
   plan.focus_account_last4 ??= null;
@@ -948,19 +820,15 @@ async function agentChatApp(
   const cq = plan.clarifying_question;
   if (cq) return String(cq);
 
-  const needs = String(plan.needs ?? "both");
+  const needs = String(plan.needs ?? "bank");
   const safeData = {
     profile: { name: firstName(snapshot.profile?.full_name ?? "") },
     subscription: safeSubscriptionPayload(subRow),
     connections: {
       bank_connected: hasBankData(snapshot),
-      credit_connected: hasCreditData(snapshot),
     },
-    bank: needs === "bank" || needs === "both"
+    bank: needs === "bank"
       ? safeBankPayload(snapshot)
-      : null,
-    credit: needs === "credit" || needs === "both"
-      ? safeCreditPayload(snapshot)
       : null,
     focus_account_last4: plan.focus_account_last4,
     session: { mode },
@@ -980,10 +848,7 @@ async function agentChatApp(
     }`,
     `\nRules:`,
     `- If bank_connected is false, do NOT talk like bank data exists. Ask 1 short question about connecting bank.`,
-    `- If credit_connected is false, do NOT invent credit metrics. Ask 1 short question about connecting credit.`,
     `- If asked for balances/transactions/bills use bank data.`,
-    `- If asked about score/limits/utilization/inquiries/derogatories use credit data.`,
-    `- Credit reports do NOT include purchase-by-purchase transactions.`,
     `\nFormatting rules:`,
     `- Use *single asterisks* for bold (example: *Important*)`,
     `- Never use **double asterisks**`,
@@ -1242,22 +1107,6 @@ async function handleChatSend(
       ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
         gate: true,
         type: "bank",
-      })
-      : null;
-    return ok({
-      user_message: shape(userRow, "user", msg),
-      assistant_message: shape(assistantRow, "assistant", reply),
-    });
-  }
-
-  // Credit gate
-  if (!(await isCreditConnected(db, userId))) {
-    const reply =
-      "Please connect your credit profile in Hutsy to unlock credit tips and score insights.";
-    const assistantRow = logEnabled
-      ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
-        gate: true,
-        type: "credit",
       })
       : null;
     return ok({

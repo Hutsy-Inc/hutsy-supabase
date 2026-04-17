@@ -153,16 +153,6 @@ async function isBankConnected(db: any, userId: string): Promise<boolean> {
   return false;
 }
 
-// deno-lint-ignore no-explicit-any
-async function isCreditConnected(db: any, userId: string): Promise<boolean> {
-  const { data } = await db
-    .from("array_identities")
-    .select("user_id")
-    .eq("user_id", userId)
-    .limit(1);
-  return (data?.length ?? 0) > 0;
-}
-
 // ---------------------------------------------------------------------------
 // Snapshot builder (mirrors hutsy/snapshot/builder.py & app-chat getSnapshot)
 // ---------------------------------------------------------------------------
@@ -232,9 +222,6 @@ async function getSnapshot(db: any, userId: string) {
     { data: accounts },
     { data: txns },
     { data: recurring },
-    { data: finance },
-    { data: risk },
-    { data: creditRows },
   ] = await Promise.all([
     db.from("profiles").select("full_name,email").eq("user_id", userId).limit(1),
     db.from("plaid_items").select("item_id,institution_name").eq("user_id", userId),
@@ -242,12 +229,6 @@ async function getSnapshot(db: any, userId: string) {
     db.from("plaid_transactions").select("*").eq("user_id", userId)
       .order("date_posted", { ascending: false }).limit(25),
     db.from("plaid_recurring").select("*").eq("user_id", userId),
-    db.from("finance_snapshots").select("credit_score").eq("user_id", userId)
-      .order("created_at", { ascending: false }).limit(1),
-    db.from("risk_summaries").select("band").eq("user_id", userId)
-      .order("created_at", { ascending: false }).limit(1),
-    db.from("credit_reports").select("*").eq("user_id", userId)
-      .order("pulled_at", { ascending: false }).limit(1),
   ]);
 
   const profile = profileRows?.[0] ?? null;
@@ -286,60 +267,7 @@ async function getSnapshot(db: any, userId: string) {
   );
   const nextBill = outflows[0] ?? { label: "Bill", amount: "0", next_date: "N/A" };
 
-  let score: number | null = null;
-  let bucket: string | null = null;
-  let creditSource = "none";
-  // deno-lint-ignore no-explicit-any
-  let creditSummary: Record<string, any> | null = null;
-  let creditConnected = false;
-
-  if (creditRows?.[0]) {
-    const r = creditRows[0];
-    score = r.credit_score ?? null;
-    bucket = r.score_bucket ?? null;
-    creditSource = r.provider ?? "array";
-    creditSummary = parseJsonField(r.ai_summary) ?? {};
-
-    const add = (key: string, col: string) => {
-      if (!(key in creditSummary!) && r[col] != null) creditSummary![key] = r[col];
-    };
-    add("score", "credit_score");
-    add("bucket", "score_bucket");
-    add("total_tradelines", "total_tradelines");
-    add("open_tradelines", "open_tradelines");
-    add("closed_tradelines", "closed_tradelines");
-    add("avg_age_open_trades_months", "avg_age_open_trades_months");
-    add("oldest_trade_months", "oldest_trade_months");
-    add("revolving_utilization_pct", "revolving_utilization_pct");
-    add("total_revolving_limit", "total_revolving_limit");
-    add("total_revolving_balance", "total_revolving_balance");
-    add("open_to_buy", "open_to_buy");
-    add("hard_inquiries_6m", "hard_inquiries_6m");
-    add("hard_inquiries_12m", "hard_inquiries_12m");
-    add("hard_inquiries_24m", "hard_inquiries_24m");
-    add("last_inquiry_date", "last_inquiry_date");
-    add("collections", "collections_count");
-    add("public_records", "public_records_count");
-    add("bankruptcies", "bankruptcies_count");
-    add("past_due_total", "past_due_total");
-    add("monthly_payment_total", "monthly_payment_total");
-    if (!("reason_codes" in creditSummary!)) {
-      creditSummary!.reason_codes = parseJsonField(r.score_reasons) ?? null;
-    }
-    creditConnected = true;
-  } else {
-    if (finance?.[0]?.credit_score != null) {
-      score = finance[0].credit_score;
-      creditSource = "finance_snapshots";
-    }
-    if (risk?.[0]?.band && !bucket) {
-      bucket = risk[0].band;
-      if (creditSource === "none") creditSource = "risk_summaries";
-    }
-    creditConnected = score != null;
-  }
-
-  const defaultCurrency = maskedAccounts.find((a) => a.currency)?.currency ?? "USD";
+  const defaultCurrency = maskedAccounts.find((a) => a.currency)?.currency ?? "CAD";
   const outgoingTotal = outflows.reduce(
     (acc, b) => acc + (parseFloat(String(b.amount ?? 0)) || 0),
     0,
@@ -350,7 +278,6 @@ async function getSnapshot(db: any, userId: string) {
     masked_accounts: maskedAccounts,
     transactions: maskedTx,
     recurring_outflows: outflows,
-    credit: { score, bucket, source: creditSource, summary: creditSummary, connected: creditConnected },
     next_bill: nextBill,
     outgoing_total: outgoingTotal.toFixed(2),
     default_currency: defaultCurrency,
@@ -380,7 +307,7 @@ interface SnapshotCard {
   cta_prompt: string;
 }
 
-function buildAiPrompt(prevHash: string, facts: Record<string, boolean>): string {
+function buildAiPrompt(prevHash: string, facts: { subscription_active: boolean; bank_connected: boolean }): string {
   return `
 You are generating ONE daily snapshot card for a premium fintech app called Hutsy.
 
@@ -396,11 +323,9 @@ You MUST output valid JSON only (no markdown, no backticks), in this exact schem
 HARD FACTS (must be respected):
 - subscription_active: ${facts.subscription_active}
 - bank_connected: ${facts.bank_connected}
-- credit_connected: ${facts.credit_connected}
 
 FORBIDDEN:
 - If bank_connected is true: DO NOT suggest connecting a bank, DO NOT mention 'Connect Bank', DO NOT imply bank is missing.
-- If credit_connected is true: DO NOT suggest connecting credit.
 - No generic filler. No disclaimers.
 - Do not mention hashes, prompts, internal logic, or "JSON".
 
@@ -522,7 +447,7 @@ async function generateDailyCard(
   // deno-lint-ignore no-explicit-any
   snapshotCtx: any,
   prevHash: string,
-  facts: Record<string, boolean>,
+  facts: { subscription_active: boolean; bank_connected: boolean },
 ): Promise<SnapshotCard> {
   const prompt = buildAiPrompt(prevHash, facts);
   const text = await anthropicMessage(prompt, snapshotCtx);
@@ -630,22 +555,10 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
     return payload;
   }
 
-  // 3) Credit gate
-  if (!(await isCreditConnected(db, userId))) {
-    const payload = await payloadForGate(
-      userId,
-      "gate_credit",
-      "Connect your credit",
-      "Connect your credit profile to unlock credit tips and utilization insights.",
-    );
-    await db.from("snapshot_current").upsert(payload, { onConflict: "user_id" });
-    return payload;
-  }
-
-  // 4) AI snapshot
+  // 3) AI snapshot
   const snapshotCtx = await getSnapshot(db, userId);
   const prevHash = await getPrevHash(db, userId);
-  const facts = { subscription_active: true, bank_connected: true, credit_connected: true };
+  const facts = { subscription_active: true, bank_connected: true };
 
   // deno-lint-ignore no-explicit-any
   let lastPayload: Record<string, any> | null = null;
