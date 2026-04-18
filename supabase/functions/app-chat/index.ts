@@ -393,7 +393,7 @@ function loanOffersAssistantPayload(): Record<string, string> {
     body:
       "I found the loan offers section for you.\n\nTap the button below to view available offers and continue securely.",
     cta_label: "View loan offers",
-    cta_target: "/app-lenders/",
+    cta_target: "/lenders/",
     cta_type: "loan_offers",
   };
 }
