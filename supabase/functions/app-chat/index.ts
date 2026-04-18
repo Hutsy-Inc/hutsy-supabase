@@ -369,9 +369,9 @@ function appQuickActions(): Array<Record<string, string>> {
       type: "chat",
     },
     {
-      id: "credit",
-      label: "Improve my credit",
-      prompt: "Give me 3 actions to improve my credit score this month.",
+      id: "spending",
+      label: "Spending insights",
+      prompt: "Break down my spending this month and highlight where I can cut back.",
       type: "chat",
     },
   ];
