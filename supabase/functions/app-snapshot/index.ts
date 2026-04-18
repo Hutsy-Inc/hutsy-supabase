@@ -153,6 +153,16 @@ async function isBankConnected(db: any, userId: string): Promise<boolean> {
   return false;
 }
 
+// deno-lint-ignore no-explicit-any
+async function isCreditConnected(db: any, userId: string): Promise<boolean> {
+  const { data } = await db
+    .from("array_identities")
+    .select("user_id")
+    .eq("user_id", userId)
+    .limit(1);
+  return !!(data?.[0]);
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot builder (mirrors hutsy/snapshot/builder.py & app-chat getSnapshot)
 // ---------------------------------------------------------------------------
@@ -296,7 +306,6 @@ const ALLOWED_CATEGORIES = new Set([
   "general_tip",
   "gate_subscription",
   "gate_bank",
-  "gate_credit",
 ]);
 
 interface SnapshotCard {
@@ -307,7 +316,10 @@ interface SnapshotCard {
   cta_prompt: string;
 }
 
-function buildAiPrompt(prevHash: string, facts: { subscription_active: boolean; bank_connected: boolean }): string {
+function buildAiPrompt(
+  prevHash: string,
+  facts: { subscription_active: boolean; bank_connected: boolean; credit_connected: boolean },
+): string {
   return `
 You are generating ONE daily snapshot card for a premium fintech app called Hutsy.
 
@@ -315,22 +327,26 @@ You MUST output valid JSON only (no markdown, no backticks), in this exact schem
 {
   "title": "string (max 80 chars)",
   "category": "one of: utilization_alert, cash_flow_warning, credit_timing, subscription_drift, general_tip",
-  "body": "string (max 260 chars). MUST be 3 short lines in this order: FACT, OUTCOME, CTA hint.",
+  "body": "string (max 260 chars). MUST be a single, smooth, conversational paragraph. Do NOT use line breaks, bullet points, or prefixes like 'ACTION:'.",
   "cta_label": "string (2–5 words, max 22 chars)",
-  "cta_prompt": "string (max 220 chars). A chat follow-up request that previews/analyses, NOT taking actions."
+  "cta_prompt": "string (max 220 chars). A chat follow-up request that previews or explains, NOT taking actions."
 }
 
 HARD FACTS (must be respected):
 - subscription_active: ${facts.subscription_active}
 - bank_connected: ${facts.bank_connected}
+- credit_connected: ${facts.credit_connected}
 
 FORBIDDEN:
 - If bank_connected is true: DO NOT suggest connecting a bank, DO NOT mention 'Connect Bank', DO NOT imply bank is missing.
-- No generic filler. No disclaimers.
+- If credit_connected is true: DO NOT suggest connecting credit.
+- If credit_connected is false: you MUST still generate a useful daily snapshot based on available bank data. Do NOT block the card and do NOT make the whole card about missing credit unless there is truly no meaningful bank insight available.
+- No generic filler. No disclaimers. No "sync your picture" unless you reference a real missing piece.
 - Do not mention hashes, prompts, internal logic, or "JSON".
 
 Style:
 - Confident, specific, helpful for today.
+- Prioritize real cash flow, balances, bills, spending patterns, and short-term money decisions when credit data is unavailable.
 - If you mention an action, make it something the user can do in-app right now.
 
 Uniqueness:
@@ -447,7 +463,7 @@ async function generateDailyCard(
   // deno-lint-ignore no-explicit-any
   snapshotCtx: any,
   prevHash: string,
-  facts: { subscription_active: boolean; bank_connected: boolean },
+  facts: { subscription_active: boolean; bank_connected: boolean; credit_connected: boolean },
 ): Promise<SnapshotCard> {
   const prompt = buildAiPrompt(prevHash, facts);
   const text = await anthropicMessage(prompt, snapshotCtx);
@@ -556,7 +572,8 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
   // 3) AI snapshot
   const snapshotCtx = await getSnapshot(db, userId);
   const prevHash = await getPrevHash(db, userId);
-  const facts = { subscription_active: true, bank_connected: true };
+  const creditConnected = await isCreditConnected(db, userId);
+  const facts = { subscription_active: true, bank_connected: true, credit_connected: creditConnected };
 
   // deno-lint-ignore no-explicit-any
   let lastPayload: Record<string, any> | null = null;

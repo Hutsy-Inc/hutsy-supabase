@@ -346,6 +346,59 @@ function buildNpsPopupPayload(
 }
 
 // ---------------------------------------------------------------------------
+// Quick actions — mirrors Python _app_quick_actions()
+// ---------------------------------------------------------------------------
+function appQuickActions(): Array<Record<string, string>> {
+  return [
+    {
+      id: "balance",
+      label: "Get a loan",
+      prompt: "Show me my loan offers.",
+      type: "loan_offers",
+    },
+    {
+      id: "transactions",
+      label: "Recent transactions",
+      prompt: "Show my recent transactions and highlight anything unusual.",
+      type: "chat",
+    },
+    {
+      id: "bills",
+      label: "Upcoming bills",
+      prompt: "What upcoming recurring bills do I have in the next 7–30 days?",
+      type: "chat",
+    },
+    {
+      id: "credit",
+      label: "Improve my credit",
+      prompt: "Give me 3 actions to improve my credit score this month.",
+      type: "chat",
+    },
+  ];
+}
+
+function matchQuickActionByPrompt(
+  message: string,
+): Record<string, string> | null {
+  const msg = (message ?? "").trim();
+  if (!msg) return null;
+  for (const action of appQuickActions()) {
+    if ((action.prompt ?? "").trim() === msg) return action;
+  }
+  return null;
+}
+
+function loanOffersAssistantPayload(): Record<string, string> {
+  return {
+    body:
+      "I found the loan offers section for you.\n\nTap the button below to view available offers and continue securely.",
+    cta_label: "View loan offers",
+    cta_target: "/app-lenders/",
+    cta_type: "loan_offers",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Gates
 // ---------------------------------------------------------------------------
 async function isSubscriptionActive(
@@ -1115,6 +1168,33 @@ async function handleChatSend(
     });
   }
 
+  // Quick action handling (chat-first CTA flows)
+  const matchedAction = matchQuickActionByPrompt(msg);
+  if (matchedAction) {
+    const actionType = (matchedAction.type ?? "").toLowerCase();
+    if (actionType === "loan_offers") {
+      const payload = loanOffersAssistantPayload();
+      const assistantRow = logEnabled
+        ? await insertAssistantMessage(db, userId, payload.body, localId, deviceId, {
+          ai_consent: aiConsent,
+          cta_label: payload.cta_label,
+          cta_target: payload.cta_target,
+          cta_type: payload.cta_type,
+          quick_action_id: matchedAction.id,
+          quick_action_type: actionType,
+        })
+        : null;
+      const assistantMessage = shape(assistantRow, "assistant", payload.body) as Record<string, unknown>;
+      assistantMessage.cta_label = payload.cta_label;
+      assistantMessage.cta_target = payload.cta_target;
+      assistantMessage.cta_type = payload.cta_type;
+      return ok({
+        user_message: shape(userRow, "user", msg),
+        assistant_message: assistantMessage,
+      });
+    }
+  }
+
   // NPS trigger — message-count based, emits popup payload (no chat bubble)
   let npsPayload = null;
   try {
@@ -1171,6 +1251,13 @@ async function handleChatSend(
   };
   if (npsPayload) resp.nps = npsPayload;
   return ok(resp);
+}
+
+// ---------------------------------------------------------------------------
+// Action: quick_actions
+// ---------------------------------------------------------------------------
+function handleQuickActions(): Response {
+  return ok({ actions: appQuickActions() });
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1333,8 @@ Deno.serve((req) =>
           return await handleChatHistory(db, userId, body);
         case "chat_clear":
           return await handleChatClear(db, userId);
+        case "quick_actions":
+          return handleQuickActions();
         case "nps_score":
           return await handleNpsScore(db, userId, body);
         case "nps_feedback":
