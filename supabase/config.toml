@@ -418,7 +418,7 @@ entrypoint = "./functions/plaid-webhook/index.ts"
 
 [functions.stripe-webhook]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/stripe-webhook/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -440,7 +440,7 @@ entrypoint = "./functions/stripe-backend/index.ts"
 
 [functions.revenuecat-webhook]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/revenuecat-webhook/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx

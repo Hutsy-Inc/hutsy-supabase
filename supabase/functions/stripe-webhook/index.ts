@@ -42,13 +42,39 @@ async function sbGetProfileByCustomer(db, stripeCustomerId) {
   const { data } = await db.from('profiles').select('user_id, email, full_name, phone').eq('stripe_customer_id', stripeCustomerId).limit(1);
   return data?.[0] ?? null;
 }
+async function sbGetSubscriptionByUserId(db, userId: string) {
+  const { data, error } = await db
+    .from('subscriptions')
+    .select('id, user_id, source, stripe_status, plan, interval, next_renewal')
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error) { console.error('[stripe-webhook] sbGetSubscriptionByUserId error:', error); return null; }
+  return data ?? null;
+}
+function isNonWebOwnedRow(row: { source?: string; id?: string } | null): boolean {
+  if (!row) return false;
+  const source = String(row.source || '').trim().toLowerCase();
+  const rowId  = String(row.id   || '').trim();
+  return source === 'ios' || source === 'android' || source === 'revenuecat' || source === 'test' || rowId.startsWith('rc_');
+}
+async function shouldIgnoreStripeForUser(db, userId: string): Promise<boolean> {
+  const row = await sbGetSubscriptionByUserId(db, userId);
+  return isNonWebOwnedRow(row);
+}
 async function sbUpsertSubscription(db, subId, userId, plan, interval, status, nextRenewal) {
+  const existing = await sbGetSubscriptionByUserId(db, userId);
+  // If this user is already owned by RevenueCat / mobile, Stripe must not overwrite it.
+  if (isNonWebOwnedRow(existing)) {
+    console.log(`[stripe-webhook] skip subscription upsert for user=${userId} sub_id=${subId} because row is non-web owned id=${existing?.id} source=${existing?.source}`);
+    return;
+  }
   const row = {
     id: subId,
     user_id: userId,
     plan,
     interval,
     stripe_status: status,
+    source: 'web',
     updated_at: new Date().toISOString()
   };
   if (nextRenewal !== null) row['next_renewal'] = nextRenewal;
@@ -415,11 +441,17 @@ async function handleSubscriptionEvent(db, sub) {
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
   if (!profile) return;
+  const userId = profile.user_id;
+  const shouldSkip = await shouldIgnoreStripeForUser(db, userId);
+  if (shouldSkip) {
+    console.log(`[stripe-webhook] skipping customer.subscription.* update for user=${userId} because subscription is non-web owned`);
+    return;
+  }
   const interval = getInterval(sub);
   const status = sub['status'] ?? 'unknown';
-  await sbUpsertSubscription(db, sub['id'], profile.user_id, 'credit_builder', interval, status, null);
-  const isPaidSub = ['active', 'trialing'].includes(status.toLowerCase());
-  if (!isPaidSub) await disconnectPlaidForUser(db, profile.user_id, `customer.subscription.${status}`);
+  await sbUpsertSubscription(db, sub['id'], userId, 'credit_builder', interval, status, null);
+  const isPaidSub = ['active', 'trialing'].includes(String(status).toLowerCase());
+  if (!isPaidSub) await disconnectPlaidForUser(db, userId, `customer.subscription.${status}`);
 }
 async function handleInvoicePaymentSucceeded(db, inv) {
   const custId = inv['customer'];
@@ -427,7 +459,12 @@ async function handleInvoicePaymentSucceeded(db, inv) {
   const profile = await sbGetProfileByCustomer(db, custId);
   if (!profile) return;
   const { user_id: uid } = profile;
+  const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
   await sbInsertPayment(db, inv['id'], uid, inv['amount_paid'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'paid', inv);
+  if (shouldSkip) {
+    console.log(`[stripe-webhook] skipping invoice.payment_succeeded subscription update for user=${uid} because subscription is non-web owned`);
+    return;
+  }
   const subId = getSubId(inv);
   if (!subId) return;
   const sub = await stripeRetrieveSubscription(subId);
@@ -446,7 +483,12 @@ async function handleInvoicePaymentFailed(db, inv) {
   const profile = await sbGetProfileByCustomer(db, custId);
   if (!profile) return;
   const { user_id: uid } = profile;
+  const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
   await sbInsertPayment(db, inv['id'], uid, inv['amount_due'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'open', inv);
+  if (shouldSkip) {
+    console.log(`[stripe-webhook] skipping invoice.payment_failed subscription update for user=${uid} because subscription is non-web owned`);
+    return;
+  }
   await disconnectPlaidForUser(db, uid, 'invoice.payment_failed');
   const amount = (inv['amount_due'] ?? 0) / 100;
   const currency = (inv['currency'] ?? 'usd').toUpperCase();
