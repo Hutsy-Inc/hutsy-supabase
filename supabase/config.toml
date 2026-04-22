@@ -407,7 +407,7 @@ entrypoint = "./functions/exchange-plaid-token/index.ts"
 
 [functions.plaid-webhook]
 enabled = true
-verify_jwt = flase
+verify_jwt = false
 import_map = "./functions/plaid-webhook/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
