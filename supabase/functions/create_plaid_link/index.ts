@@ -22,7 +22,11 @@
  *
  * Example Usage:
  * See the code comments for a sample `curl` command to invoke this function locally.
- */ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+ */ 
+
+// testing the supabase
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from "npm:plaid";
 const corsHeaders = {
