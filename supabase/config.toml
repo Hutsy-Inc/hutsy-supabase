@@ -385,7 +385,7 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.create_plaid_link]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/create_plaid_link/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -396,7 +396,7 @@ entrypoint = "./functions/create_plaid_link/index.ts"
 
 [functions.exchange-plaid-token]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/exchange-plaid-token/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -407,7 +407,7 @@ entrypoint = "./functions/exchange-plaid-token/index.ts"
 
 [functions.plaid-webhook]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/plaid-webhook/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -418,7 +418,7 @@ entrypoint = "./functions/plaid-webhook/index.ts"
 
 [functions.stripe-webhook]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/stripe-webhook/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -429,7 +429,7 @@ entrypoint = "./functions/stripe-webhook/index.ts"
 
 [functions.stripe-backend]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/stripe-backend/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -440,7 +440,7 @@ entrypoint = "./functions/stripe-backend/index.ts"
 
 [functions.array-backend]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/array-backend/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -451,7 +451,7 @@ entrypoint = "./functions/array-backend/index.ts"
 
 [functions.revenuecat-webhook]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/revenuecat-webhook/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -462,7 +462,7 @@ entrypoint = "./functions/revenuecat-webhook/index.ts"
 
 [functions.hutsy-compute]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/hutsy-compute/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
