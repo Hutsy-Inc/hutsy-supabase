@@ -81,9 +81,21 @@ Deno.serve(async (req)=>{
       });
     }
     const user = userData.user;
+    const userIdShort = user.id.substring(0, 8);
+    console.log(`[create_plaid_link] called userId=${userIdShort}`);
+
+    const PLAID_ENV = Deno.env.get("PLAID_ENV");
+    if (!PLAID_ENV) {
+      console.error("[create_plaid_link] PLAID_ENV secret is not set");
+      return new Response(JSON.stringify({ error: "PLAID_ENV missing" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+    console.log(`[create_plaid_link] PLAID_ENV=${PLAID_ENV}`);
+
     const PLAID_CLIENT_ID = Deno.env.get("PLAID_CLIENT_ID");
     const PLAID_SECRET = Deno.env.get("PLAID_SECRET");
-    const PLAID_ENV = Deno.env.get("PLAID_ENV") || "sandbox";
     const PLAID_IOS_REDIRECT_URI = Deno.env.get("PLAID_IOS_REDIRECT_URI") || "";
     const PLAID_ANDROID_PACKAGE_NAME = Deno.env.get("PLAID_ANDROID_PACKAGE_NAME") || "";
     if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
@@ -102,6 +114,13 @@ Deno.serve(async (req)=>{
     const webhookUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/plaid-webhook`;
     const body = await req.json().catch(()=>({}));
     const platform = (body?.platform ?? "").toString().toLowerCase();
+
+    console.log(`[create_plaid_link] platform=${platform}`);
+    console.log(`[create_plaid_link] redirect_uri_set=${Boolean(PLAID_IOS_REDIRECT_URI)}`);
+    console.log(`[create_plaid_link] android_package_name_set=${Boolean(PLAID_ANDROID_PACKAGE_NAME)}`);
+    console.log(`[create_plaid_link] country_codes=CA products=transactions,auth client_name=Hutsy`);
+    console.log(`[create_plaid_link] webhook_configured=${Boolean(webhookUrl)}`);
+
     const request = {
       user: {
         client_user_id: user.id
@@ -119,13 +138,17 @@ Deno.serve(async (req)=>{
     };
     if (platform === "ios" && PLAID_IOS_REDIRECT_URI) {
       request.redirect_uri = PLAID_IOS_REDIRECT_URI;
+      console.log("[create_plaid_link] redirect_uri applied for ios");
     }
     if (platform === "android" && PLAID_ANDROID_PACKAGE_NAME) {
       request.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
+      console.log("[create_plaid_link] android_package_name applied");
     }
     const response = await plaidClient.linkTokenCreate(request);
+    const linkToken = response.data.link_token;
+    console.log(`[create_plaid_link] link_token created length=${linkToken?.length ?? 0}`);
     return new Response(JSON.stringify({
-      link_token: response.data.link_token
+      link_token: linkToken
     }), {
       status: 200,
       headers: {
@@ -134,12 +157,15 @@ Deno.serve(async (req)=>{
       }
     });
   } catch (error) {
-    console.error("[create_plaid_link] Error:", error);
+    console.error("[create_plaid_link] Error:", error instanceof Error ? error.message : error);
+    const plaidErr = error && typeof error === "object" && "response" in error ? (error as any).response?.data : null;
+    if (plaidErr) {
+      console.error(`[create_plaid_link] plaid error_code=${plaidErr.error_code} error_message=${plaidErr.error_message} request_id=${plaidErr.request_id}`);
+    }
     const errorMessage = error instanceof Error ? error.message : "Failed to create link token";
-    const errorDetails = error && typeof error === "object" && "response" in error ? error.response?.data : null;
     return new Response(JSON.stringify({
       error: errorMessage,
-      details: errorDetails
+      details: plaidErr
     }), {
       status: 500,
       headers: {
