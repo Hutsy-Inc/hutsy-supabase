@@ -31,12 +31,14 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS"
 };
 Deno.serve(async (req)=>{
+  console.log(`[create_plaid_link] request method=${req.method}`);
   if (req.method === "OPTIONS") {
     return new Response("ok", {
       headers: corsHeaders
     });
   }
   if (req.method !== "POST") {
+    console.warn("[create_plaid_link] rejected non-POST request");
     return new Response(JSON.stringify({
       error: "Method not allowed"
     }), {
@@ -50,6 +52,7 @@ Deno.serve(async (req)=>{
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
+      console.warn("[create_plaid_link] missing Authorization header");
       return new Response(JSON.stringify({
         error: "Missing Authorization header"
       }), {
@@ -67,6 +70,7 @@ Deno.serve(async (req)=>{
         }
       }
     });
+    console.log("[create_plaid_link] verifying user JWT");
     const { data: userData, error: userError } = await supabaseClient.auth.getUser();
     if (userError || !userData.user) {
       console.error("[create_plaid_link] auth.getUser failed", userError);
@@ -81,12 +85,15 @@ Deno.serve(async (req)=>{
       });
     }
     const user = userData.user;
+    console.log(`[create_plaid_link] authenticated user_id=${user.id}`);
     const PLAID_CLIENT_ID = Deno.env.get("PLAID_CLIENT_ID");
     const PLAID_SECRET = Deno.env.get("PLAID_SECRET");
     const PLAID_ENV = Deno.env.get("PLAID_ENV") || "sandbox";
     const PLAID_IOS_REDIRECT_URI = Deno.env.get("PLAID_IOS_REDIRECT_URI") || "";
     const PLAID_ANDROID_PACKAGE_NAME = Deno.env.get("PLAID_ANDROID_PACKAGE_NAME") || "";
+    console.log(`[create_plaid_link] plaid_env=${PLAID_ENV}`);
     if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
+      console.error("[create_plaid_link] missing Plaid credentials in environment");
       throw new Error("Missing Plaid credentials");
     }
     const configuration = new Configuration({
@@ -102,6 +109,7 @@ Deno.serve(async (req)=>{
     const webhookUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/plaid-webhook`;
     const body = await req.json().catch(()=>({}));
     const platform = (body?.platform ?? "").toString().toLowerCase();
+    console.log(`[create_plaid_link] platform=${platform} webhook_url=${webhookUrl}`);
     const request = {
       user: {
         client_user_id: user.id
@@ -118,12 +126,16 @@ Deno.serve(async (req)=>{
       webhook: webhookUrl
     };
     if (platform === "ios" && PLAID_IOS_REDIRECT_URI) {
+      console.log(`[create_plaid_link] adding iOS redirect_uri`);
       request.redirect_uri = PLAID_IOS_REDIRECT_URI;
     }
     if (platform === "android" && PLAID_ANDROID_PACKAGE_NAME) {
+      console.log(`[create_plaid_link] adding Android package_name`);
       request.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
     }
+    console.log(`[create_plaid_link] calling Plaid linkTokenCreate user_id=${user.id}`);
     const response = await plaidClient.linkTokenCreate(request);
+    console.log(`[create_plaid_link] link token created successfully user_id=${user.id}`);
     return new Response(JSON.stringify({
       link_token: response.data.link_token
     }), {

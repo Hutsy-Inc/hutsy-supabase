@@ -7,12 +7,14 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS"
 };
 Deno.serve(async (req)=>{
+  console.log(`[exchange-plaid-token] request method=${req.method}`);
   if (req.method === "OPTIONS") {
     return new Response("ok", {
       headers: corsHeaders
     });
   }
   if (req.method !== "POST") {
+    console.warn("[exchange-plaid-token] rejected non-POST request");
     return new Response(JSON.stringify({
       error: "Method not allowed"
     }), {
@@ -26,6 +28,7 @@ Deno.serve(async (req)=>{
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
+      console.warn("[exchange-plaid-token] missing Authorization header");
       return new Response(JSON.stringify({
         error: "Missing Authorization header"
       }), {
@@ -43,6 +46,7 @@ Deno.serve(async (req)=>{
         }
       }
     });
+    console.log("[exchange-plaid-token] verifying user JWT");
     const { data: userData, error: userError } = await supabaseClient.auth.getUser();
     if (userError || !userData.user) {
       console.error("[exchange-plaid-token] auth.getUser failed", userError);
@@ -57,10 +61,13 @@ Deno.serve(async (req)=>{
       });
     }
     const user = userData.user;
+    console.log(`[exchange-plaid-token] authenticated user_id=${user.id}`);
     const body = await req.json().catch(()=>({}));
     const publicToken = body?.public_token;
     const institutionName = (body?.institution_name ?? "").toString();
+    console.log(`[exchange-plaid-token] institution_name="${institutionName}" public_token_present=${!!publicToken}`);
     if (!publicToken) {
+      console.warn("[exchange-plaid-token] missing public_token in request body");
       return new Response(JSON.stringify({
         error: "Missing public_token"
       }), {
@@ -74,7 +81,9 @@ Deno.serve(async (req)=>{
     const PLAID_CLIENT_ID = Deno.env.get("PLAID_CLIENT_ID");
     const PLAID_SECRET = Deno.env.get("PLAID_SECRET");
     const PLAID_ENV = Deno.env.get("PLAID_ENV") || "sandbox";
+    console.log(`[exchange-plaid-token] plaid_env=${PLAID_ENV}`);
     if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
+      console.error("[exchange-plaid-token] missing Plaid credentials in environment");
       throw new Error("Missing Plaid credentials");
     }
     const configuration = new Configuration({
@@ -87,12 +96,15 @@ Deno.serve(async (req)=>{
       }
     });
     const plaidClient = new PlaidApi(configuration);
+    console.log(`[exchange-plaid-token] calling Plaid itemPublicTokenExchange user_id=${user.id}`);
     const exchangeResponse = await plaidClient.itemPublicTokenExchange({
       public_token: publicToken
     });
     const { access_token, item_id } = exchangeResponse.data;
+    console.log(`[exchange-plaid-token] token exchange success item_id=${item_id} user_id=${user.id}`);
     const adminClient = createClient(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "");
     const now = new Date().toISOString();
+    console.log(`[exchange-plaid-token] upserting plaid_items item_id=${item_id} user_id=${user.id}`);
     const { error: itemError } = await adminClient.from("plaid_items").upsert({
       user_id: user.id,
       item_id,
@@ -103,7 +115,12 @@ Deno.serve(async (req)=>{
     }, {
       onConflict: "item_id"
     });
-    if (itemError) throw itemError;
+    if (itemError) {
+      console.error(`[exchange-plaid-token] plaid_items upsert failed item_id=${item_id}:`, itemError);
+      throw itemError;
+    }
+    console.log(`[exchange-plaid-token] plaid_items upsert ok item_id=${item_id}`);
+    console.log(`[exchange-plaid-token] upserting plaid_item_secrets item_id=${item_id} user_id=${user.id}`);
     const { error: secretError } = await adminClient.from("plaid_item_secrets").upsert({
       user_id: user.id,
       item_id,
@@ -113,12 +130,18 @@ Deno.serve(async (req)=>{
     }, {
       onConflict: "item_id"
     });
-    if (secretError) throw secretError;
+    if (secretError) {
+      console.error(`[exchange-plaid-token] plaid_item_secrets upsert failed item_id=${item_id}:`, secretError);
+      throw secretError;
+    }
+    console.log(`[exchange-plaid-token] plaid_item_secrets upsert ok item_id=${item_id}`);
     if (PLAID_ENV === "production") {
+      console.log(`[exchange-plaid-token] clearing bank_disconnected_at for user_id=${user.id}`);
       await adminClient.from("profiles").update({
         bank_disconnected_at: null
       }).eq("user_id", user.id);
     }
+    console.log(`[exchange-plaid-token] success item_id=${item_id} user_id=${user.id} institution="${institutionName}"`);
     return new Response(JSON.stringify({
       item_id,
       status: "connected",
