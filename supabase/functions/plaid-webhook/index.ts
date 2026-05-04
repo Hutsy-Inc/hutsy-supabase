@@ -80,6 +80,7 @@ function minutesSince(isoTs) {
 // Supabase upsert helpers (mirrors PHP sb_* functions)
 // ---------------------------------------------------------------------------
 async function sbUpsertAccounts(db, userId, itemId, accounts, plaidEnv) {
+  console.log(`[plaid-webhook] sbUpsertAccounts item=${itemId} count=${accounts.length}`);
   if (!accounts.length) return;
   const rows = accounts.map((a)=>({
       user_id: userId,
@@ -100,6 +101,7 @@ async function sbUpsertAccounts(db, userId, itemId, accounts, plaidEnv) {
   if (error) console.error('sbUpsertAccounts error:', error);
 }
 async function sbUpsertTransactions(db, userId, itemId, txns, plaidEnv) {
+  console.log(`[plaid-webhook] sbUpsertTransactions item=${itemId} count=${txns.length}`);
   if (!txns.length) return;
   const CHUNK = 200;
   for(let i = 0; i < txns.length; i += CHUNK){
@@ -125,6 +127,7 @@ async function sbUpsertTransactions(db, userId, itemId, txns, plaidEnv) {
   }
 }
 async function sbUpsertRecurring(db, userId, itemId, rec, plaidEnv) {
+  console.log(`[plaid-webhook] sbUpsertRecurring item=${itemId}`);
   const { error } = await db.from('plaid_recurring').upsert({
     user_id: userId,
     item_id: itemId,
@@ -139,6 +142,7 @@ async function sbUpsertRecurring(db, userId, itemId, rec, plaidEnv) {
   if (error) console.error('sbUpsertRecurring error:', error);
 }
 async function sbLogWebhookEvent(db, userId, itemId, payload, plaidEnv) {
+  console.log(`[plaid-webhook] sbLogWebhookEvent item=${itemId} type=${payload['webhook_type']} code=${payload['webhook_code']}`);
   const { error } = await db.from('plaid_webhook_events').insert({
     user_id: userId,
     item_id: itemId,
@@ -154,12 +158,16 @@ async function sbLogWebhookEvent(db, userId, itemId, payload, plaidEnv) {
 // Plaid data fetchers
 // ---------------------------------------------------------------------------
 async function plaidFetchAccounts(plaid, accessToken) {
+  console.log("[plaid-webhook] plaidFetchAccounts calling /accounts/get");
   const res = await plaid.accountsGet({
     access_token: accessToken
   });
-  return res.data.accounts ?? [];
+  const accounts = res.data.accounts ?? [];
+  console.log(`[plaid-webhook] plaidFetchAccounts done count=${accounts.length}`);
+  return accounts;
 }
 async function plaidFetchTransactionsAll(plaid, accessToken, days = 90) {
+  console.log(`[plaid-webhook] plaidFetchTransactionsAll days=${days}`);
   const startDate = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
   const endDate = new Date().toISOString().slice(0, 10);
   let txns = [];
@@ -187,6 +195,7 @@ async function plaidFetchTransactionsAll(plaid, accessToken, days = 90) {
   return txns;
 }
 async function plaidFetchRecurring(plaid, accessToken, accounts) {
+  console.log("[plaid-webhook] plaidFetchRecurring calling /transactions/recurring/get");
   const res = await plaid.transactionsRecurringGet({
     access_token: accessToken
   });
@@ -241,6 +250,7 @@ async function refreshItemNow(db, plaid, userId, itemId, accessToken, plaidEnv, 
   console.log(`[plaid-webhook] refresh done item=${itemId} txns=${txns.length}`);
 }
 async function buildSnapshot(db, userId) {
+  console.log(`[plaid-webhook] buildSnapshot user=${userId}`);
   // 1) Accounts (join with items for institution name)
   const { data: accs } = await db.from('plaid_accounts').select('account_id, name, mask, balances, item_id').eq('user_id', userId);
   const itemIds = [
@@ -305,6 +315,7 @@ async function buildSnapshot(db, userId) {
       };
     }
   }
+  console.log(`[plaid-webhook] buildSnapshot done accounts=${maskedAccounts.length} txns=${transactions.length} next_bill=${nextBill ? nextBill.label : "none"}`);
   return {
     default_currency: defaultCurrency,
     transactions,
@@ -502,6 +513,7 @@ async function storeSystemMessage(db, userId, body, meta, dedupeKey) {
 async function processNotifications(db, userId, itemId, payload) {
   const wtype = payload['webhook_type'] ?? '';
   const wcode = payload['webhook_code'] ?? '';
+  console.log(`[plaid-webhook] processNotifications item=${itemId} user=${userId} type=${wtype} code=${wcode}`);
   // ------------------------------------------------------------------
   // Initial connect suppression
   // ------------------------------------------------------------------
@@ -714,7 +726,8 @@ Deno.serve(async (req)=>{
   let payload;
   try {
     payload = JSON.parse(raw);
-  } catch  {
+  } catch {
+    console.warn("[plaid-webhook] invalid JSON received");
     return new Response('invalid json', {
       status: 400,
       headers: {
@@ -723,7 +736,9 @@ Deno.serve(async (req)=>{
     });
   }
   const itemId = payload['item_id'];
+  console.log(`[plaid-webhook] received webhook item_id=${itemId} type=${payload['webhook_type']} code=${payload['webhook_code']}`);
   if (!itemId) {
+    console.warn("[plaid-webhook] missing item_id in payload");
     return new Response('missing item_id', {
       status: 400,
       headers: {

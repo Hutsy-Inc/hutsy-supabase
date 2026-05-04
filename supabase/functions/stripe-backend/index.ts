@@ -147,6 +147,7 @@ async function sbUpsertSubscription(subId, userId, interval, status, nextRenewal
 // Response: { client_secret, stripe_customer_id }
 // ---------------------------------------------------------------------------
 async function handleSetupIntentMobile(req) {
+  console.log("[stripe-backend] handleSetupIntentMobile start");
   const authHeader = req.headers.get('Authorization') ?? '';
   if (!authHeader.startsWith('Bearer ')) return err('Unauthorized', 401);
   const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY');
@@ -160,14 +161,18 @@ async function handleSetupIntentMobile(req) {
   });
   const { data: { user }, error: authError } = await userClient.auth.getUser();
   if (authError || !user) return err('Unauthorized', 401);
+  console.log(`[stripe-backend] handleSetupIntentMobile user_id=${user.id}`);
   // 1. Look up profile for existing stripe_customer_id
   const db = buildAdminClient();
+  console.log(`[stripe-backend] looking up profile for user_id=${user.id}`);
   const { data: profile } = await db.from('profiles').select('email, phone, stripe_customer_id').eq('user_id', user.id).maybeSingle();
   const email = profile?.['email'] ?? user.email ?? '';
   const phone = profile?.['phone'] ?? '';
   let customerId = profile?.['stripe_customer_id'] ?? '';
+  console.log(`[stripe-backend] existing stripe_customer_id=${customerId || "none"}`);
   // 2. Create customer if needed
   if (!customerId) {
+    console.log(`[stripe-backend] creating Stripe customer for user_id=${user.id}`);
     const customer = await stripe('POST', '/customers', {
       email,
       phone,
@@ -176,6 +181,7 @@ async function handleSetupIntentMobile(req) {
       }
     });
     customerId = customer['id'];
+    console.log(`[stripe-backend] Stripe customer created customer_id=${customerId}`);
     // Persist customer id immediately so finalize_mobile can find it
     await db.from('profiles').update({
       stripe_customer_id: customerId,
@@ -183,6 +189,7 @@ async function handleSetupIntentMobile(req) {
     }).eq('user_id', user.id);
   }
   // 3. Create SetupIntent — saves card for future off-session charges
+  console.log(`[stripe-backend] creating SetupIntent customer_id=${customerId}`);
   const si = await stripe('POST', '/setup_intents', {
     customer: customerId,
     usage: 'off_session',
@@ -196,6 +203,7 @@ async function handleSetupIntentMobile(req) {
   });
   const clientSecret = si['client_secret'];
   if (!clientSecret) return err('Failed to create SetupIntent', 500);
+  console.log(`[stripe-backend] SetupIntent created customer_id=${customerId}`);
   return ok({
     client_secret: clientSecret,
     stripe_customer_id: customerId
@@ -212,6 +220,7 @@ async function handleSetupIntentMobile(req) {
 // ---------------------------------------------------------------------------
 const REQUIRE_PARTNER_CONSENT = (Deno.env.get('REQUIRE_PARTNER_CONSENT') ?? 'false') === 'true';
 async function handleFinalize(body) {
+  console.log("[stripe-backend] handleFinalize start");
   const customerId = body['stripe_customer_id']?.trim();
   const email = body['email']?.trim();
   const name = body['name']?.trim() ?? '';
@@ -225,6 +234,7 @@ async function handleFinalize(body) {
   if (!tosConsent) return err('Please agree to Terms & Privacy.');
   if (REQUIRE_PARTNER_CONSENT && !partnerConsent) return err('Please consent to partner sharing.');
   if (password.length < 8) return err('Password missing or too short.');
+  console.log(`[stripe-backend] handleFinalize customer_id=${customerId} tos_consent=${tosConsent}`);
   let pmId = body['payment_method_id']?.trim() ?? '';
   // 1) Ensure a payment method is attached to the customer
   if (pmId) {
@@ -263,6 +273,7 @@ async function handleFinalize(body) {
   // 2) Flatten consent to text (mirrors PHP)
   const flatConsent = `tos:${tosConsent} | partner:${partnerConsent}`;
   // 3) Create Supabase auth user
+  console.log(`[stripe-backend] creating Supabase auth user email=${email}`);
   const sbUser = await sbAdminCreateUser(email, password, {
     full_name: name,
     phone,
@@ -271,8 +282,10 @@ async function handleFinalize(body) {
     stripe_customer_id: customerId
   });
   if (!sbUser?.id) throw new Error('Missing Supabase user ID');
+  console.log(`[stripe-backend] handleFinalize auth user created sb_user_id=${sbUser.id}`);
   // 4) Upsert profile row
   await sbUpsertProfile(sbUser.id, email, name, phone, zip, flatConsent, customerId);
+  console.log(`[stripe-backend] handleFinalize complete sb_user_id=${sbUser.id}`);
   return ok({
     sb_user_id: sbUser.id,
     message: 'Account created, card saved, and profile synced.'
@@ -289,6 +302,7 @@ async function handleFinalize(body) {
 // Response: { subscription_id }
 // ---------------------------------------------------------------------------
 async function handleCreateUpsellSubscription(body) {
+  console.log("[stripe-backend] handleCreateUpsellSubscription start");
   const customerId = body['stripe_customer_id']?.trim();
   const sbUserId = body['sb_user_id']?.trim() ?? '';
   const flowId = body['flow_id']?.trim() ?? crypto.randomUUID();
@@ -296,8 +310,10 @@ async function handleCreateUpsellSubscription(body) {
   if (!customerId) return err('stripe_customer_id is required');
   const PRICE_ID = Deno.env.get('STRIPE_PRICE_ID');
   if (!PRICE_ID) return err('STRIPE_PRICE_ID not configured', 500);
+  console.log(`[stripe-backend] handleCreateUpsellSubscription customer_id=${customerId} sb_user_id=${sbUserId || "none"}`);
   // Guard 1: client already has a subscription id from a previous call
   if (existingSubId) {
+    console.log(`[stripe-backend] guard1 subscription already exists (client) sub_id=${existingSubId}`);
     return ok({
       subscription_id: existingSubId,
       message: 'Subscription already created (client).'
@@ -329,6 +345,7 @@ async function handleCreateUpsellSubscription(body) {
       }
     }
   }
+  console.log(`[stripe-backend] no existing subscription found, creating new subscription customer_id=${customerId}`);
   // Create the subscription with a 5-minute trial and an idempotency key
   const trialEnd = Math.floor(Date.now() / 1000) + 300;
   const idempotencyKey = `hutsy_upsell_${shortHash(customerId + '|' + flowId)}`;
@@ -359,6 +376,7 @@ async function handleCreateUpsellSubscription(body) {
     const nextRenewal = periodEnd ? new Date(periodEnd * 1000).toISOString() : trialEndTs ? new Date(trialEndTs * 1000).toISOString() : null;
     await sbUpsertSubscription(sub['id'], sbUserId, interval, status, nextRenewal);
   }
+  console.log(`[stripe-backend] subscription created sub_id=${sub['id']} customer_id=${customerId}`);
   return ok({
     subscription_id: sub['id'],
     message: 'Subscription created. Billing starts after trial.'
@@ -374,6 +392,7 @@ async function handleCreateUpsellSubscription(body) {
 // Response: { message }
 // ---------------------------------------------------------------------------
 async function handleActivateMobile(req, body) {
+  console.log("[stripe-backend] handleActivateMobile start");
   const authHeader = req.headers.get('Authorization') ?? '';
   if (!authHeader.startsWith('Bearer ')) return err('Unauthorized', 401);
   const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY');
@@ -387,6 +406,7 @@ async function handleActivateMobile(req, body) {
   });
   const { data: { user }, error: authError } = await userClient.auth.getUser();
   if (authError || !user) return err('Unauthorized', 401);
+  console.log(`[stripe-backend] handleActivateMobile user_id=${user.id}`);
   const stripeCustomerId = body['stripe_customer_id']?.trim();
   const subscriptionId = body['subscription_id']?.trim();
   if (!stripeCustomerId) return err('stripe_customer_id is required');
@@ -411,7 +431,9 @@ async function handleActivateMobile(req, body) {
   } catch (e) {
     console.error('[stripe-backend] activate_mobile stripe fetch error:', e);
   }
+  console.log(`[stripe-backend] activate_mobile upserting subscription sub_id=${subscriptionId} interval=${interval} status=${status}`);
   await sbUpsertSubscription(subscriptionId, user.id, interval, status, nextRenewal);
+  console.log(`[stripe-backend] activate_mobile complete user_id=${user.id}`);
   return ok({
     message: 'Subscription activated.'
   });
@@ -425,6 +447,7 @@ async function handleActivateMobile(req, body) {
 // Response: { message }
 // ---------------------------------------------------------------------------
 async function handleDeleteUser(req) {
+  console.log("[stripe-backend] handleDeleteUser start");
   const authHeader = req.headers.get('Authorization') ?? '';
   if (!authHeader.startsWith('Bearer ')) return err('Unauthorized', 401);
   const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY');
@@ -438,12 +461,14 @@ async function handleDeleteUser(req) {
   });
   const { data: { user }, error: authError } = await userClient.auth.getUser();
   if (authError || !user) return err('Unauthorized', 401);
+  console.log(`[stripe-backend] handleDeleteUser user_id=${user.id}`);
   const db = buildAdminClient();
   const { error } = await db.auth.admin.deleteUser(user.id);
   if (error) {
     console.error('[stripe-backend] delete_user error:', error);
     return err('Failed to delete user', 500);
   }
+  console.log(`[stripe-backend] handleDeleteUser success user_id=${user.id}`);
   return ok({
     message: 'User deleted.'
   });
@@ -458,6 +483,7 @@ async function handleDeleteUser(req) {
 // Response: { message }
 // ---------------------------------------------------------------------------
 async function handleFinalizeMobile(req, body) {
+  console.log("[stripe-backend] handleFinalizeMobile start");
   const authHeader = req.headers.get('Authorization') ?? '';
   if (!authHeader.startsWith('Bearer ')) return err('Unauthorized', 401);
   const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY');
@@ -472,10 +498,12 @@ async function handleFinalizeMobile(req, body) {
   });
   const { data: { user }, error: authError } = await userClient.auth.getUser();
   if (authError || !user) return err('Unauthorized', 401);
+  console.log(`[stripe-backend] handleFinalizeMobile user_id=${user.id}`);
   const stripeCustomerId = body['stripe_customer_id']?.trim();
   const tosConsent = body['tos_consent'] === true || body['tos_consent'] === 'true';
   if (!stripeCustomerId) return err('stripe_customer_id is required');
   if (!tosConsent) return err('Please agree to Terms & Privacy.');
+  console.log(`[stripe-backend] handleFinalizeMobile linking customer_id=${stripeCustomerId} to user_id=${user.id}`);
   const db = buildAdminClient();
   const { error } = await db.from('profiles').update({
     stripe_customer_id: stripeCustomerId,
@@ -485,6 +513,7 @@ async function handleFinalizeMobile(req, body) {
     console.error('[stripe-backend] finalize_mobile error:', error);
     return err('Failed to update profile', 500);
   }
+  console.log(`[stripe-backend] handleFinalizeMobile complete user_id=${user.id} customer_id=${stripeCustomerId}`);
   return ok({
     message: 'Profile linked to Stripe customer.'
   });
@@ -509,6 +538,7 @@ Deno.serve(async (req)=>{
     return err('invalid json');
   }
   const action = body['action'];
+  console.log(`[stripe-backend] action=${action ?? "(none)"}`);
   try {
     switch(action){
       // ── Mobile (new) ──────────────────────────────────────────────────────

@@ -40,6 +40,7 @@ Deno.serve(async (req)=>{
       headers: corsHeaders
     });
   }
+  console.log(`[create_plaid_link] request method=${req.method}`);
   if (req.method !== "POST") {
     return new Response(JSON.stringify({
       error: "Method not allowed"
@@ -85,6 +86,7 @@ Deno.serve(async (req)=>{
       });
     }
     const user = userData.user;
+    console.log(`[create_plaid_link] authenticated user_id=${user.id}`);
     const PLAID_CLIENT_ID = Deno.env.get("PLAID_CLIENT_ID");
     const PLAID_SECRET = Deno.env.get("PLAID_SECRET");
     const PLAID_ENV = Deno.env.get("PLAID_ENV") || "sandbox";
@@ -106,6 +108,7 @@ Deno.serve(async (req)=>{
     const webhookUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/plaid-webhook`;
     const body = await req.json().catch(()=>({}));
     const platform = (body?.platform ?? "").toString().toLowerCase();
+    console.log(`[create_plaid_link] plaid_env=${PLAID_ENV} platform=${platform || "none"}`);
     const request = {
       user: {
         client_user_id: user.id
@@ -127,7 +130,9 @@ Deno.serve(async (req)=>{
     if (platform === "android" && PLAID_ANDROID_PACKAGE_NAME) {
       request.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
     }
+    console.log(`[create_plaid_link] calling Plaid linkTokenCreate user_id=${user.id}`);
     const response = await plaidClient.linkTokenCreate(request);
+    console.log(`[create_plaid_link] linkTokenCreate success user_id=${user.id}`);
     return new Response(JSON.stringify({
       link_token: response.data.link_token
     }), {

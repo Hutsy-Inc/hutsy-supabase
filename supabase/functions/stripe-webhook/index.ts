@@ -438,11 +438,16 @@ async function stripeRetrieveSubscription(subId) {
 // Event handlers
 // ---------------------------------------------------------------------------
 async function handleSubscriptionEvent(db, sub) {
+  console.log(`[stripe-webhook] handleSubscriptionEvent sub_id=${sub['id']} status=${sub['status']}`);
   const custId = sub['customer'];
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
-  if (!profile) return;
+  if (!profile) {
+    console.warn(`[stripe-webhook] handleSubscriptionEvent no profile for customer_id=${custId}`);
+    return;
+  }
   const userId = profile.user_id;
+  console.log(`[stripe-webhook] handleSubscriptionEvent customer_id=${custId} user_id=${userId}`);
   const shouldSkip = await shouldIgnoreStripeForUser(db, userId);
   if (shouldSkip) {
     console.log(`[stripe-webhook] skipping customer.subscription.* update for user=${userId} because subscription is non-web owned`);
@@ -450,6 +455,7 @@ async function handleSubscriptionEvent(db, sub) {
   }
   const interval = getInterval(sub);
   const status = sub['status'] ?? 'unknown';
+  console.log(`[stripe-webhook] handleSubscriptionEvent upserting sub interval=${interval} status=${status} user_id=${userId}`);
   await sbUpsertSubscription(db, sub['id'], userId, 'credit_builder', interval, status, null);
   const isPaidSub = [
     'active',
@@ -460,11 +466,16 @@ async function handleSubscriptionEvent(db, sub) {
   }
 }
 async function handleInvoicePaymentSucceeded(db, inv) {
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded invoice_id=${inv['id']} amount_paid=${inv['amount_paid']}`);
   const custId = inv['customer'];
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
-  if (!profile) return;
+  if (!profile) {
+    console.warn(`[stripe-webhook] handleInvoicePaymentSucceeded no profile for customer_id=${custId}`);
+    return;
+  }
   const uid = profile.user_id;
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded customer_id=${custId} user_id=${uid}`);
   const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
   await sbInsertPayment(db, inv['id'], uid, inv['amount_paid'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'paid', inv);
   if (shouldSkip) {
@@ -472,23 +483,32 @@ async function handleInvoicePaymentSucceeded(db, inv) {
     return;
   }
   const subId = getSubId(inv);
-  if (!subId) return;
+  if (!subId) {
+    console.warn(`[stripe-webhook] handleInvoicePaymentSucceeded no sub_id in invoice_id=${inv['id']}`);
+    return;
+  }
   const sub = await stripeRetrieveSubscription(subId);
   if (!sub) return;
   const interval = getInterval(sub);
   const status = sub['status'] ?? 'unknown';
   const nextRenewal = getNextRenewal(inv, sub);
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded sub_id=${subId} interval=${interval} status=${status} next_renewal=${nextRenewal}`);
   await sbUpsertSubscription(db, subId, uid, 'credit_builder', interval, status, nextRenewal);
   const amount = (inv['amount_paid'] ?? 0) / 100;
   const currency = (inv['currency'] ?? 'usd').toUpperCase();
   await handleSubscriptionNotification(db, uid, status, amount, currency);
 }
 async function handleInvoicePaymentFailed(db, inv) {
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed invoice_id=${inv['id']} amount_due=${inv['amount_due']}`);
   const custId = inv['customer'];
   if (!custId) return;
   const profile = await sbGetProfileByCustomer(db, custId);
-  if (!profile) return;
+  if (!profile) {
+    console.warn(`[stripe-webhook] handleInvoicePaymentFailed no profile for customer_id=${custId}`);
+    return;
+  }
   const uid = profile.user_id;
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed customer_id=${custId} user_id=${uid}`);
   const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
   await sbInsertPayment(db, inv['id'], uid, inv['amount_due'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'open', inv);
   if (shouldSkip) {

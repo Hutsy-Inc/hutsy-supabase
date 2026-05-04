@@ -15,6 +15,7 @@ function json(data, status = 200) {
   });
 }
 Deno.serve(async (req)=>{
+  console.log(`[sync-subscription-row] request method=${req.method}`);
   if (req.method === "OPTIONS") {
     return new Response("ok", {
       headers: corsHeaders
@@ -29,6 +30,7 @@ Deno.serve(async (req)=>{
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
+      console.warn("[sync-subscription-row] missing Authorization header");
       return json({
         ok: false,
         error: "missing_authorization_header"
@@ -43,12 +45,14 @@ Deno.serve(async (req)=>{
     });
     const { data: userData, error: userError } = await supabaseUserClient.auth.getUser();
     if (userError || !userData.user) {
+      console.warn("[sync-subscription-row] auth failed", userError?.message);
       return json({
         ok: false,
         error: "unauthorized"
       }, 401);
     }
     const userId = userData.user.id;
+    console.log(`[sync-subscription-row] authenticated user_id=${userId}`);
     const body = await req.json().catch(()=>({}));
     const plan = (body?.plan ?? "credit_builder").toString();
     const intervalRaw = body?.interval;
@@ -57,13 +61,16 @@ Deno.serve(async (req)=>{
     const nextRenewalRaw = body?.next_renewal;
     const nextRenewal = nextRenewalRaw == null || nextRenewalRaw.toString().trim().isEmpty ? null : nextRenewalRaw.toString().trim();
     const source = (body?.source ?? "revenuecat").toString().trim();
+    console.log(`[sync-subscription-row] params plan=${plan} interval=${interval} stripe_status=${stripeStatus} source=${source} next_renewal=${nextRenewal}`);
     if (!stripeStatus) {
+      console.warn("[sync-subscription-row] missing stripe_status");
       return json({
         ok: false,
         error: "missing_stripe_status"
       }, 400);
     }
     const supabaseAdmin = createClient(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "");
+    console.log(`[sync-subscription-row] looking up existing subscription row for user_id=${userId}`);
     const { data: existingRow, error: existingError } = await supabaseAdmin.from("subscriptions").select("id, user_id").eq("user_id", userId).maybeSingle();
     if (existingError) {
       console.error("[sync-subscription-row] existing row lookup failed:", existingError);
@@ -73,6 +80,7 @@ Deno.serve(async (req)=>{
         details: existingError.message
       }, 500);
     }
+    console.log(`[sync-subscription-row] existing row found=${!!existingRow} id=${existingRow?.id ?? "none"}`);
     const payload = {
       plan,
       interval,
@@ -82,6 +90,7 @@ Deno.serve(async (req)=>{
       next_renewal: nextRenewal
     };
     if (existingRow) {
+      console.log(`[sync-subscription-row] updating existing row id=${existingRow.id} user_id=${userId}`);
       const { error: updateError } = await supabaseAdmin.from("subscriptions").update(payload).eq("user_id", userId);
       if (updateError) {
         console.error("[sync-subscription-row] update failed:", updateError);
@@ -91,6 +100,7 @@ Deno.serve(async (req)=>{
           details: updateError.message
         }, 500);
       }
+      console.log(`[sync-subscription-row] update success user_id=${userId} id=${existingRow.id}`);
       return json({
         ok: true,
         action: "updated",
@@ -99,6 +109,7 @@ Deno.serve(async (req)=>{
       });
     }
     const syntheticId = `rc_${userId}`;
+    console.log(`[sync-subscription-row] inserting new row id=${syntheticId} user_id=${userId}`);
     const { error: insertError } = await supabaseAdmin.from("subscriptions").insert({
       id: syntheticId,
       user_id: userId,
@@ -112,6 +123,7 @@ Deno.serve(async (req)=>{
         details: insertError.message
       }, 500);
     }
+    console.log(`[sync-subscription-row] insert success user_id=${userId} id=${syntheticId}`);
     return json({
       ok: true,
       action: "inserted",

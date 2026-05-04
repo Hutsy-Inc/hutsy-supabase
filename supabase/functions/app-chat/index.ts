@@ -269,17 +269,26 @@ async function getLastNpsSentDt(
 // deno-lint-ignore no-explicit-any
 async function cooldownOk(db: any, userId: string): Promise<boolean> {
   const last = await getLastNpsSentDt(db, userId);
-  if (!last) return true;
-  return utcNow().getTime() - last.getTime() >= NPS_COOLDOWN_DAYS * 86_400_000;
+  if (!last) {
+    console.log(`[app-chat] cooldownOk no prior NPS, ok to send user_id=${userId}`);
+    return true;
+  }
+  const ok = utcNow().getTime() - last.getTime() >= NPS_COOLDOWN_DAYS * 86_400_000;
+  console.log(`[app-chat] cooldownOk result=${ok} last_sent=${last.toISOString()} user_id=${userId}`);
+  return ok;
 }
 
 // deno-lint-ignore no-explicit-any
 async function ensureScheduledNps(db: any, userId: string): Promise<any> {
+  console.log(`[app-chat] ensureScheduledNps user_id=${userId}`);
   const latest = await getLatestNps(db, userId);
   if (
     latest &&
     ["scheduled", "pending_score", "pending_feedback"].includes(latest.status)
-  ) return latest;
+  ) {
+    console.log(`[app-chat] ensureScheduledNps reusing existing survey status=${latest.status} id=${latest.id}`);
+    return latest;
+  }
 
   if (!(await cooldownOk(db, userId))) return latest;
 
@@ -307,6 +316,7 @@ async function ensureScheduledNps(db: any, userId: string): Promise<any> {
     .from("nps_surveys")
     .insert(payload)
     .select();
+  console.log(`[app-chat] ensureScheduledNps created new survey status=scheduled user_id=${userId}`);
   return created?.[0] ?? payload;
 }
 
@@ -407,6 +417,7 @@ async function isSubscriptionActive(
   userId: string,
   // deno-lint-ignore no-explicit-any
 ): Promise<[boolean, any]> {
+  console.log(`[app-chat] isSubscriptionActive user_id=${userId}`);
   const { data: subs } = await db
     .from("subscriptions")
     .select("*")
@@ -414,22 +425,35 @@ async function isSubscriptionActive(
     .order("updated_at", { ascending: false })
     .limit(1);
   const sub = subs?.[0] ?? null;
-  if (!sub) return [false, null];
+  if (!sub) {
+    console.log(`[app-chat] isSubscriptionActive no subscription row user_id=${userId}`);
+    return [false, null];
+  }
   const status = (sub.stripe_status ?? "").toLowerCase().trim();
-  return [status === "active" || status === "trialing", sub];
+  const active = status === "active" || status === "trialing";
+  console.log(`[app-chat] isSubscriptionActive result=${active} status=${status} user_id=${userId}`);
+  return [active, sub];
 }
 
 // deno-lint-ignore no-explicit-any
 async function isBankConnected(db: any, userId: string): Promise<boolean> {
+  console.log(`[app-chat] isBankConnected user_id=${userId}`);
   const { data: items } = await db
     .from("plaid_items")
     .select("status")
     .eq("user_id", userId);
-  if (!items?.length) return false;
+  if (!items?.length) {
+    console.log(`[app-chat] isBankConnected no plaid items user_id=${userId}`);
+    return false;
+  }
   for (const it of items) {
     const st = String(it.status || "").toLowerCase();
-    if (["connected", "active", "good"].includes(st)) return true;
+    if (["connected", "active", "good"].includes(st)) {
+      console.log(`[app-chat] isBankConnected result=true status=${st} user_id=${userId}`);
+      return true;
+    }
   }
+  console.log(`[app-chat] isBankConnected result=false items=${items.length} user_id=${userId}`);
   return false;
 }
 
@@ -504,6 +528,7 @@ function maskTxn(txns: any[], acctLookup: Record<string, any>) {
 
 // deno-lint-ignore no-explicit-any
 async function getSnapshot(db: any, userId: string) {
+  console.log(`[app-chat] getSnapshot user_id=${userId}`);
   const [
     { data: profileRows },
     { data: items },
@@ -580,6 +605,7 @@ async function getSnapshot(db: any, userId: string) {
     0,
   );
 
+  console.log(`[app-chat] getSnapshot done accounts=${maskedAccounts.length} txns=${maskedTx.length} outflows=${outflows.length} user_id=${userId}`);
   return {
     profile: {
       full_name: profile?.full_name ?? "Hutsy member",
@@ -856,6 +882,7 @@ async function agentChatApp(
   const fallback =
     "I can help with balances, bills, transactions, and credit insights. What do you want to check?";
 
+  console.log(`[app-chat] agentChatApp start mode=${mode} msg_length=${userMsg.length}`);
   // deno-lint-ignore no-explicit-any
   let plan: Record<string, any>;
   try {
@@ -870,6 +897,7 @@ async function agentChatApp(
     };
   }
 
+  console.log(`[app-chat] agentPlan result needs=${plan.needs} task=${plan.task} has_cq=${!!plan.clarifying_question}`);
   const cq = plan.clarifying_question;
   if (cq) return String(cq);
 
@@ -912,6 +940,7 @@ async function agentChatApp(
 
   try {
     const reply = (await anthropicMessage(system, userContent, 260)).trim();
+    console.log(`[app-chat] agentChatApp reply_length=${reply.length} mode=${mode}`);
     return reply || fallback;
   } catch (e) {
     console.error("[app-chat] agentChatApp error:", e);
@@ -928,6 +957,7 @@ async function handleNpsScore(
   userId: string,
   body: any,
 ): Promise<Response> {
+  console.log(`[app-chat] handleNpsScore user_id=${userId}`);
   const scoreRaw = body.score;
   if (
     scoreRaw === null || scoreRaw === undefined ||
@@ -940,10 +970,12 @@ async function handleNpsScore(
 
   const survey = await getLatestNps(db, userId);
   if (!survey || survey.status !== "pending_score") {
+    console.log(`[app-chat] handleNpsScore no pending_score survey user_id=${userId} status=${survey?.status ?? "none"}`);
     return ok({ ignored: true });
   }
 
   const tag = scoreI >= 9 ? "promoter" : scoreI >= 6 ? "passive" : "detractor";
+  console.log(`[app-chat] handleNpsScore recording score=${scoreI} tag=${tag} survey_id=${survey.id}`);
   await db
     .from("nps_surveys")
     .update({
@@ -1010,14 +1042,17 @@ async function handleNpsFeedback(
   userId: string,
   body: any,
 ): Promise<Response> {
+  console.log(`[app-chat] handleNpsFeedback user_id=${userId}`);
   let feedback = (body.feedback ?? "").trim();
   if (!feedback) return err("feedback required");
   if (feedback.length > 500) feedback = feedback.slice(0, 500);
 
   const survey = await getLatestNps(db, userId);
   if (!survey || survey.status !== "pending_feedback") {
+    console.log(`[app-chat] handleNpsFeedback no pending_feedback survey user_id=${userId} status=${survey?.status ?? "none"}`);
     return ok({ ignored: true });
   }
+  console.log(`[app-chat] handleNpsFeedback recording feedback length=${feedback.length} survey_id=${survey.id}`);
 
   await db
     .from("nps_surveys")
@@ -1056,7 +1091,9 @@ async function handleChatSend(
 
   // AI consent gate (Apple requirement)
   const aiConsent = readAiConsent(req, body);
+  console.log(`[app-chat] handleChatSend ai_consent=${aiConsent} mode=${mode} msg_length=${msg.length}`);
   if (aiConsent !== "granted") {
+    console.warn(`[app-chat] handleChatSend AI consent gate blocked ai_consent=${aiConsent} user_id=${userId}`);
     const reply = aiConsentBlockReply();
     const assistantRow = logEnabled
       ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
@@ -1137,6 +1174,7 @@ async function handleChatSend(
   // Subscription gate
   const [subActive, subRow] = await isSubscriptionActive(db, userId);
   if (!subActive) {
+    console.warn(`[app-chat] handleChatSend subscription gate blocked user_id=${userId}`);
     const reply = "Your plan is not active. Please update payment to continue.";
     const assistantRow = logEnabled
       ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
@@ -1154,6 +1192,7 @@ async function handleChatSend(
 
   // Bank gate
   if (!(await isBankConnected(db, userId))) {
+    console.warn(`[app-chat] handleChatSend bank gate blocked user_id=${userId}`);
     const reply =
       "Please connect your bank in Hutsy to unlock balances, bills, and alerts.";
     const assistantRow = logEnabled
@@ -1171,6 +1210,7 @@ async function handleChatSend(
   // Quick action handling (chat-first CTA flows)
   const matchedAction = matchQuickActionByPrompt(msg);
   if (matchedAction) {
+    console.log(`[app-chat] handleChatSend quick action matched id=${matchedAction.id} type=${matchedAction.type}`);
     const actionType = (matchedAction.type ?? "").toLowerCase();
     if (actionType === "loan_offers") {
       const payload = loanOffersAssistantPayload();
@@ -1228,6 +1268,7 @@ async function handleChatSend(
             .update({ nps_state: "pending_score", nps_sent_at: nowIso })
             .eq("user_id", userId);
           npsPayload = buildNpsPopupPayload("score", name, survey.id);
+          console.log(`[app-chat] handleChatSend NPS triggered survey_id=${survey.id} count=${newCount}`);
         }
       }
     }
@@ -1236,8 +1277,10 @@ async function handleChatSend(
   }
 
   // AI response
+  console.log(`[app-chat] handleChatSend building AI response user_id=${userId}`);
   const history = await buildHistory(db, userId);
   const reply = await agentChatApp(msg, snapshot, history, mode, subRow);
+  console.log(`[app-chat] handleChatSend AI response ready reply_length=${reply.length}`);
 
   const assistantRow = logEnabled
     ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
@@ -1269,10 +1312,12 @@ async function handleChatHistory(
   userId: string,
   body: any,
 ): Promise<Response> {
+  console.log(`[app-chat] handleChatHistory user_id=${userId}`);
   const { enabled } = await getChatSettings(db);
   if (!enabled) return ok({ messages: [] });
 
   const limit = Math.max(1, Math.min(parseInt(String(body.limit ?? 80)), 200));
+  console.log(`[app-chat] handleChatHistory fetching limit=${limit}`);
   const { data: rows } = await db
     .from("chat_messages")
     .select("id,created_at,role,direction,body,channel,meta")
@@ -1289,12 +1334,14 @@ async function handleChatHistory(
 // ---------------------------------------------------------------------------
 // deno-lint-ignore no-explicit-any
 async function handleChatClear(db: any, userId: string): Promise<Response> {
+  console.log(`[app-chat] handleChatClear user_id=${userId}`);
   try {
     await db
       .from("chat_messages")
       .delete()
       .eq("user_id", userId)
       .eq("channel", "app");
+    console.log(`[app-chat] handleChatClear success user_id=${userId}`);
     return ok({});
   } catch (e) {
     console.error("[app-chat] chat_clear error:", e);
