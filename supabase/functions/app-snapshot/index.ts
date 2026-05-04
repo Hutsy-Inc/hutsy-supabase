@@ -127,6 +127,7 @@ function buildAskPrompt(title: string, body: string, ctaPrompt = ""): string {
 // ---------------------------------------------------------------------------
 // deno-lint-ignore no-explicit-any
 async function isSubscriptionActive(db: any, userId: string): Promise<[boolean, any]> {
+  console.log(`[app-snapshot] isSubscriptionActive checking user_id=${userId}`);
   const { data: subs } = await db
     .from("subscriptions")
     .select("*")
@@ -134,22 +135,35 @@ async function isSubscriptionActive(db: any, userId: string): Promise<[boolean, 
     .order("updated_at", { ascending: false })
     .limit(1);
   const sub = subs?.[0] ?? null;
-  if (!sub) return [false, null];
+  if (!sub) {
+    console.log(`[app-snapshot] isSubscriptionActive no subscription row found user_id=${userId}`);
+    return [false, null];
+  }
   const status = (sub.stripe_status ?? "").toLowerCase().trim();
-  return [status === "active" || status === "trialing", sub];
+  const active = status === "active" || status === "trialing";
+  console.log(`[app-snapshot] isSubscriptionActive user_id=${userId} stripe_status=${status} active=${active}`);
+  return [active, sub];
 }
 
 // deno-lint-ignore no-explicit-any
 async function isBankConnected(db: any, userId: string): Promise<boolean> {
+  console.log(`[app-snapshot] isBankConnected checking user_id=${userId}`);
   const { data: items } = await db
     .from("plaid_items")
     .select("status")
     .eq("user_id", userId);
-  if (!items?.length) return false;
+  if (!items?.length) {
+    console.log(`[app-snapshot] isBankConnected no plaid_items found user_id=${userId}`);
+    return false;
+  }
   for (const it of items) {
     const st = String(it.status || "").toLowerCase();
-    if (["connected", "active", "good"].includes(st)) return true;
+    if (["connected", "active", "good"].includes(st)) {
+      console.log(`[app-snapshot] isBankConnected connected item found status=${st} user_id=${userId}`);
+      return true;
+    }
   }
+  console.log(`[app-snapshot] isBankConnected no active item found user_id=${userId}`);
   return false;
 }
 
@@ -216,6 +230,7 @@ function maskTxn(txns: any[], acctLookup: Record<string, any>) {
 
 // deno-lint-ignore no-explicit-any
 async function getSnapshot(db: any, userId: string) {
+  console.log(`[app-snapshot] getSnapshot start user_id=${userId}`);
   const [
     { data: profileRows },
     { data: items },
@@ -273,6 +288,7 @@ async function getSnapshot(db: any, userId: string) {
     0,
   );
 
+  console.log(`[app-snapshot] getSnapshot done user_id=${userId} accounts=${maskedAccounts.length} txns=${maskedTx.length} outflows=${outflows.length}`);
   return {
     profile: { full_name: profile?.full_name ?? "Hutsy member", email: profile?.email ?? null },
     masked_accounts: maskedAccounts,
@@ -423,8 +439,12 @@ function parseAiJson(text: string): SnapshotCard {
 }
 
 async function anthropicMessage(prompt: string, snapshotCtx: unknown): Promise<string> {
+  console.log("[app-snapshot] anthropicMessage calling Anthropic API");
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return "";
+  if (!apiKey) {
+    console.warn("[app-snapshot] anthropicMessage ANTHROPIC_API_KEY not set, returning empty");
+    return "";
+  }
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -443,7 +463,9 @@ async function anthropicMessage(prompt: string, snapshotCtx: unknown): Promise<s
     }),
   });
   const j = await res.json();
-  return (j.content?.[0]?.text ?? "").trim();
+  const text = (j.content?.[0]?.text ?? "").trim();
+  console.log(`[app-snapshot] anthropicMessage response length=${text.length}`);
+  return text;
 }
 
 async function generateDailyCard(
@@ -452,9 +474,12 @@ async function generateDailyCard(
   prevHash: string,
   facts: { subscription_active: boolean; bank_connected: boolean },
 ): Promise<SnapshotCard> {
+  console.log(`[app-snapshot] generateDailyCard start prev_hash=${prevHash || "none"} sub_active=${facts.subscription_active} bank_connected=${facts.bank_connected}`);
   const prompt = buildAiPrompt(prevHash, facts);
   const text = await anthropicMessage(prompt, snapshotCtx);
-  return parseAiJson(text);
+  const card = parseAiJson(text);
+  console.log(`[app-snapshot] generateDailyCard done category=${card.category} title_length=${card.title.length}`);
+  return card;
 }
 
 // ---------------------------------------------------------------------------
@@ -533,9 +558,11 @@ async function getPrevHash(db: any, userId: string): Promise<string> {
 
 // deno-lint-ignore no-explicit-any
 async function buildAndStoreToday(db: any, userId: string): Promise<Record<string, any>> {
+  console.log(`[app-snapshot] buildAndStoreToday start user_id=${userId}`);
   // 1) Subscription gate
   const [subActive] = await isSubscriptionActive(db, userId);
   if (!subActive) {
+    console.log(`[app-snapshot] buildAndStoreToday subscription gate hit user_id=${userId}`);
     const payload = await payloadForGate(
       userId,
       "gate_subscription",
@@ -543,11 +570,13 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
       "Your plan is not active. Update payment to receive daily snapshots.",
     );
     await db.from("snapshot_current").upsert(payload, { onConflict: "user_id" });
+    console.log(`[app-snapshot] buildAndStoreToday gate_subscription payload stored user_id=${userId}`);
     return payload;
   }
 
   // 2) Bank gate — never cache, always re-check on next request
   if (!(await isBankConnected(db, userId))) {
+    console.log(`[app-snapshot] buildAndStoreToday bank gate hit user_id=${userId}`);
     return await payloadForGate(
       userId,
       "gate_bank",
@@ -557,14 +586,17 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
   }
 
   // 3) AI snapshot
+  console.log(`[app-snapshot] buildAndStoreToday building AI snapshot user_id=${userId}`);
   const snapshotCtx = await getSnapshot(db, userId);
   const prevHash = await getPrevHash(db, userId);
+  console.log(`[app-snapshot] buildAndStoreToday prev_hash=${prevHash || "none"} user_id=${userId}`);
   const facts = { subscription_active: true, bank_connected: true };
 
   // deno-lint-ignore no-explicit-any
   let lastPayload: Record<string, any> | null = null;
 
   for (let attempt = 0; attempt < 4; attempt++) {
+    console.log(`[app-snapshot] buildAndStoreToday AI card attempt=${attempt + 1} user_id=${userId}`);
     const card = await generateDailyCard(snapshotCtx, prevHash, facts);
 
     const h = await stableContentHash(
@@ -573,6 +605,7 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
       card.cta_label,
       card.cta_prompt,
     );
+    console.log(`[app-snapshot] buildAndStoreToday attempt=${attempt + 1} new_hash=${h} prev_hash=${prevHash || "none"} hash_changed=${h !== prevHash}`);
 
     lastPayload = {
       user_id: userId,
@@ -607,7 +640,9 @@ async function buildAndStoreToday(db: any, userId: string): Promise<Record<strin
     };
   }
 
+  console.log(`[app-snapshot] buildAndStoreToday upserting snapshot user_id=${userId} category=${lastPayload?.category}`);
   await db.from("snapshot_current").upsert(lastPayload, { onConflict: "user_id" });
+  console.log(`[app-snapshot] buildAndStoreToday snapshot stored user_id=${userId}`);
   return lastPayload;
 }
 
@@ -648,6 +683,7 @@ async function optionalMatchGuard(
  */
 // deno-lint-ignore no-explicit-any
 async function handleSnapshotCurrent(db: any, userId: string): Promise<Response> {
+  console.log(`[app-snapshot] handleSnapshotCurrent start user_id=${userId}`);
   // Read current row
   const { data: rows } = await db
     .from("snapshot_current")
@@ -658,16 +694,20 @@ async function handleSnapshotCurrent(db: any, userId: string): Promise<Response>
   const row = rows?.[0] ?? null;
   const isGateRow = (r: any) => String(r?.category ?? "").startsWith("gate_");
 
+  console.log(`[app-snapshot] handleSnapshotCurrent cached_row=${!!row} valid_for_today=${row ? isRowValidForToday(row) : false} is_gate=${row ? isGateRow(row) : false}`);
   // Serve cached row only if valid for today AND not a stale gate response
   if (row && isRowValidForToday(row) && !isGateRow(row)) {
+    console.log(`[app-snapshot] handleSnapshotCurrent serving cached snapshot user_id=${userId}`);
     return ok({ snapshot: ensureAskPrompt(row) });
   }
 
   // Build today's snapshot (gate responses are no longer written to DB)
+  console.log(`[app-snapshot] handleSnapshotCurrent building fresh snapshot user_id=${userId}`);
   const payload = await buildAndStoreToday(db, userId);
 
   // If gate response, return it directly (no DB row to re-read)
   if (isGateRow(payload)) {
+    console.log(`[app-snapshot] handleSnapshotCurrent returning gate payload category=${payload.category} user_id=${userId}`);
     return ok({ snapshot: ensureAskPrompt(payload) });
   }
 
@@ -678,6 +718,7 @@ async function handleSnapshotCurrent(db: any, userId: string): Promise<Response>
     .eq("user_id", userId)
     .limit(1);
 
+  console.log(`[app-snapshot] handleSnapshotCurrent returning fresh snapshot user_id=${userId}`);
   return ok({ snapshot: ensureAskPrompt(rows2?.[0] ?? payload) });
 }
 
@@ -700,28 +741,34 @@ async function handleSnapshotFeedback(
 ): Promise<Response> {
   // Accept either "feedback" or "choice" field
   const choice = safeStr(body.choice || body.feedback).toLowerCase();
+  console.log(`[app-snapshot] handleSnapshotFeedback start user_id=${userId} choice=${choice}`);
   if (choice !== "yes" && choice !== "no") {
+    console.warn(`[app-snapshot] handleSnapshotFeedback invalid choice="${choice}" user_id=${userId}`);
     return err("feedback must be 'yes' or 'no'");
   }
 
   const providedDay = safeStr(body.day);
   const providedHash = safeStr(body.content_hash);
+  console.log(`[app-snapshot] handleSnapshotFeedback provided_day=${providedDay || "none"} provided_hash=${providedHash || "none"}`);
 
   // Guard: skip counter bump if client day/hash doesn't match current snapshot
   const matched = await optionalMatchGuard(db, userId, providedDay, providedHash);
   if (!matched) {
+    console.log(`[app-snapshot] handleSnapshotFeedback snapshot mismatch, ignoring user_id=${userId}`);
     return ok({ ignored: true, reason: "snapshot_mismatch" });
   }
 
   const nowIso = utcNowIso();
 
   // 1) Update feedback fields on snapshot_current (service role)
+  console.log(`[app-snapshot] handleSnapshotFeedback updating last_feedback=${choice} user_id=${userId}`);
   await db
     .from("snapshot_current")
     .update({ last_feedback: choice, last_feedback_at: nowIso })
     .eq("user_id", userId);
 
   // 2) Atomic counter bump via RPC — must run under the user's JWT so auth.uid() resolves
+  console.log(`[app-snapshot] handleSnapshotFeedback calling bump_snapshot_feedback RPC choice=${choice} user_id=${userId}`);
   const token = getAuthToken(req);
   const userClient = buildUserClient(token);
   const { error: rpcErr } = await userClient
@@ -732,6 +779,7 @@ async function handleSnapshotFeedback(
     return err(`feedback rpc failed: ${rpcErr.message}`, 500);
   }
 
+  console.log(`[app-snapshot] handleSnapshotFeedback success choice=${choice} user_id=${userId}`);
   return ok({ choice });
 }
 
