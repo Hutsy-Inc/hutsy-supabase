@@ -101,6 +101,7 @@ Deno.serve(async (req)=>{
     if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
       throw new Error("Missing Plaid credentials");
     }
+    console.log(`[create_plaid_link] client_id_set=${Boolean(PLAID_CLIENT_ID)} secret_set=${Boolean(PLAID_SECRET)}`);
     const configuration = new Configuration({
       basePath: PlaidEnvironments[PLAID_ENV],
       baseOptions: {
@@ -138,7 +139,12 @@ Deno.serve(async (req)=>{
     };
     if (platform === "ios" && PLAID_IOS_REDIRECT_URI) {
       request.redirect_uri = PLAID_IOS_REDIRECT_URI;
-      console.log("[create_plaid_link] redirect_uri applied for ios");
+      try {
+        const u = new URL(PLAID_IOS_REDIRECT_URI);
+        console.log(`[create_plaid_link] redirect_uri applied for ios host=${u.hostname} path=${u.pathname}`);
+      } catch {
+        console.log("[create_plaid_link] redirect_uri applied for ios (unparseable)");
+      }
     }
     if (platform === "android" && PLAID_ANDROID_PACKAGE_NAME) {
       request.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
@@ -146,7 +152,8 @@ Deno.serve(async (req)=>{
     }
     const response = await plaidClient.linkTokenCreate(request);
     const linkToken = response.data.link_token;
-    console.log(`[create_plaid_link] link_token created length=${linkToken?.length ?? 0}`);
+    const plaidRequestId = response.data.request_id ?? response.headers?.["plaid-request-id"] ?? null;
+    console.log(`[create_plaid_link] link_token created length=${linkToken?.length ?? 0} plaid_request_id=${plaidRequestId}`);
     return new Response(JSON.stringify({
       link_token: linkToken
     }), {
