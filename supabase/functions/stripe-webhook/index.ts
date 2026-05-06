@@ -438,60 +438,104 @@ async function stripeRetrieveSubscription(subId) {
 // ---------------------------------------------------------------------------
 async function handleSubscriptionEvent(db, sub) {
   const custId = sub['customer'];
-  if (!custId) return;
+  const subId = sub['id'];
+  const status = sub['status'] ?? 'unknown';
+  console.log(`[stripe-webhook] handleSubscriptionEvent sub_id=${subId} customer_id=${custId} status=${status}`);
+  if (!custId) {
+    console.warn('[stripe-webhook] handleSubscriptionEvent missing customer_id, skipping');
+    return;
+  }
   const profile = await sbGetProfileByCustomer(db, custId);
-  if (!profile) return;
+  if (!profile) {
+    console.warn(`[stripe-webhook] handleSubscriptionEvent no profile found customer_id=${custId}`);
+    return;
+  }
   const userId = profile.user_id;
+  console.log(`[stripe-webhook] handleSubscriptionEvent resolved user_id=${userId}`);
   const shouldSkip = await shouldIgnoreStripeForUser(db, userId);
   if (shouldSkip) {
     console.log(`[stripe-webhook] skipping customer.subscription.* update for user=${userId} because subscription is non-web owned`);
     return;
   }
   const interval = getInterval(sub);
-  const status = sub['status'] ?? 'unknown';
-  await sbUpsertSubscription(db, sub['id'], userId, 'credit_builder', interval, status, null);
+  console.log(`[stripe-webhook] handleSubscriptionEvent upserting subscription sub_id=${subId} user_id=${userId} status=${status} interval=${interval}`);
+  await sbUpsertSubscription(db, subId, userId, 'credit_builder', interval, status, null);
   const isPaidSub = ['active', 'trialing'].includes(String(status).toLowerCase());
-  if (!isPaidSub) await disconnectPlaidForUser(db, userId, `customer.subscription.${status}`);
+  if (!isPaidSub) {
+    console.log(`[stripe-webhook] handleSubscriptionEvent status=${status} is not paid, disconnecting Plaid user_id=${userId}`);
+    await disconnectPlaidForUser(db, userId, `customer.subscription.${status}`);
+  }
 }
 async function handleInvoicePaymentSucceeded(db, inv) {
   const custId = inv['customer'];
-  if (!custId) return;
+  const invId = inv['id'];
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded inv_id=${invId} customer_id=${custId} amount_paid=${inv['amount_paid']} currency=${inv['currency']}`);
+  if (!custId) {
+    console.warn('[stripe-webhook] handleInvoicePaymentSucceeded missing customer_id, skipping');
+    return;
+  }
   const profile = await sbGetProfileByCustomer(db, custId);
-  if (!profile) return;
+  if (!profile) {
+    console.warn(`[stripe-webhook] handleInvoicePaymentSucceeded no profile found customer_id=${custId}`);
+    return;
+  }
   const { user_id: uid } = profile;
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded resolved user_id=${uid}`);
   const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
-  await sbInsertPayment(db, inv['id'], uid, inv['amount_paid'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'paid', inv);
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded inserting payment record inv_id=${invId} user_id=${uid}`);
+  await sbInsertPayment(db, invId, uid, inv['amount_paid'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'paid', inv);
   if (shouldSkip) {
     console.log(`[stripe-webhook] skipping invoice.payment_succeeded subscription update for user=${uid} because subscription is non-web owned`);
     return;
   }
   const subId = getSubId(inv);
-  if (!subId) return;
+  if (!subId) {
+    console.warn(`[stripe-webhook] handleInvoicePaymentSucceeded could not resolve sub_id from invoice inv_id=${invId}`);
+    return;
+  }
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded fetching Stripe subscription sub_id=${subId}`);
   const sub = await stripeRetrieveSubscription(subId);
-  if (!sub) return;
+  if (!sub) {
+    console.error(`[stripe-webhook] handleInvoicePaymentSucceeded could not retrieve subscription sub_id=${subId}`);
+    return;
+  }
   const interval = getInterval(sub);
   const status = sub['status'] ?? 'unknown';
   const nextRenewal = getNextRenewal(inv, sub);
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded upserting subscription sub_id=${subId} user_id=${uid} status=${status} interval=${interval} next_renewal=${nextRenewal}`);
   await sbUpsertSubscription(db, subId, uid, 'credit_builder', interval, status, nextRenewal);
   const amount = (inv['amount_paid'] ?? 0) / 100;
   const currency = (inv['currency'] ?? 'usd').toUpperCase();
+  console.log(`[stripe-webhook] handleInvoicePaymentSucceeded sending notification user_id=${uid} status=${status} amount=${amount} currency=${currency}`);
   await handleSubscriptionNotification(db, uid, status, amount, currency);
 }
 async function handleInvoicePaymentFailed(db, inv) {
   const custId = inv['customer'];
-  if (!custId) return;
+  const invId = inv['id'];
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed inv_id=${invId} customer_id=${custId} amount_due=${inv['amount_due']} currency=${inv['currency']}`);
+  if (!custId) {
+    console.warn('[stripe-webhook] handleInvoicePaymentFailed missing customer_id, skipping');
+    return;
+  }
   const profile = await sbGetProfileByCustomer(db, custId);
-  if (!profile) return;
+  if (!profile) {
+    console.warn(`[stripe-webhook] handleInvoicePaymentFailed no profile found customer_id=${custId}`);
+    return;
+  }
   const { user_id: uid } = profile;
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed resolved user_id=${uid}`);
   const shouldSkip = await shouldIgnoreStripeForUser(db, uid);
-  await sbInsertPayment(db, inv['id'], uid, inv['amount_due'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'open', inv);
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed inserting payment record inv_id=${invId} user_id=${uid}`);
+  await sbInsertPayment(db, invId, uid, inv['amount_due'] ?? 0, inv['currency'] ?? 'usd', inv['status'] ?? 'open', inv);
   if (shouldSkip) {
     console.log(`[stripe-webhook] skipping invoice.payment_failed subscription update for user=${uid} because subscription is non-web owned`);
     return;
   }
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed disconnecting Plaid user_id=${uid}`);
   await disconnectPlaidForUser(db, uid, 'invoice.payment_failed');
   const amount = (inv['amount_due'] ?? 0) / 100;
   const currency = (inv['currency'] ?? 'usd').toUpperCase();
+  console.log(`[stripe-webhook] handleInvoicePaymentFailed sending past_due notification user_id=${uid} amount=${amount} currency=${currency}`);
   await handleSubscriptionNotification(db, uid, 'past_due', amount, currency);
 }
 // ---------------------------------------------------------------------------

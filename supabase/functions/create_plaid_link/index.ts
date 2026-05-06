@@ -31,12 +31,14 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS"
 };
 Deno.serve(async (req)=>{
+  console.log(`[create_plaid_link] request method=${req.method}`);
   if (req.method === "OPTIONS") {
     return new Response("ok", {
       headers: corsHeaders
     });
   }
   if (req.method !== "POST") {
+    console.warn("[create_plaid_link] rejected non-POST request");
     return new Response(JSON.stringify({
       error: "Method not allowed"
     }), {
@@ -50,6 +52,7 @@ Deno.serve(async (req)=>{
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
+      console.warn("[create_plaid_link] missing Authorization header");
       return new Response(JSON.stringify({
         error: "Missing Authorization header"
       }), {
@@ -67,6 +70,7 @@ Deno.serve(async (req)=>{
         }
       }
     });
+    console.log("[create_plaid_link] verifying user JWT");
     const { data: userData, error: userError } = await supabaseClient.auth.getUser();
     if (userError || !userData.user) {
       console.error("[create_plaid_link] auth.getUser failed", userError);
@@ -99,6 +103,7 @@ Deno.serve(async (req)=>{
     const PLAID_IOS_REDIRECT_URI = Deno.env.get("PLAID_IOS_REDIRECT_URI") || "";
     const PLAID_ANDROID_PACKAGE_NAME = Deno.env.get("PLAID_ANDROID_PACKAGE_NAME") || "";
     if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
+      console.error("[create_plaid_link] missing Plaid credentials in environment");
       throw new Error("Missing Plaid credentials");
     }
     console.log(`[create_plaid_link] client_id_set=${Boolean(PLAID_CLIENT_ID)} secret_set=${Boolean(PLAID_SECRET)}`);
@@ -138,6 +143,7 @@ Deno.serve(async (req)=>{
       webhook: webhookUrl
     };
     if (platform === "ios" && PLAID_IOS_REDIRECT_URI) {
+      console.log(`[create_plaid_link] adding iOS redirect_uri`);
       request.redirect_uri = PLAID_IOS_REDIRECT_URI;
       try {
         const u = new URL(PLAID_IOS_REDIRECT_URI);
@@ -147,9 +153,11 @@ Deno.serve(async (req)=>{
       }
     }
     if (platform === "android" && PLAID_ANDROID_PACKAGE_NAME) {
+      console.log(`[create_plaid_link] adding Android package_name`);
       request.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
       console.log("[create_plaid_link] android_package_name applied");
     }
+    console.log(`[create_plaid_link] calling Plaid linkTokenCreate user_id=${user.id}`);
     const response = await plaidClient.linkTokenCreate(request);
     const linkToken = response.data.link_token;
     const plaidRequestId = response.data.request_id ?? response.headers?.["plaid-request-id"] ?? null;
@@ -200,4 +208,4 @@ Deno.serve(async (req)=>{
       "phone": "+1 415 5550123"
     }'
 
-*/ 
+*/

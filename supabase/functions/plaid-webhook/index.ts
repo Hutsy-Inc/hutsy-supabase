@@ -81,7 +81,11 @@ function minutesSince(isoTs) {
 // Supabase upsert helpers (mirrors PHP sb_* functions)
 // ---------------------------------------------------------------------------
 async function sbUpsertAccounts(db, userId, itemId, accounts, plaidEnv) {
-  if (!accounts.length) return;
+  console.log(`[plaid-webhook] sbUpsertAccounts item_id=${itemId} user_id=${userId} accounts=${accounts.length}`);
+  if (!accounts.length) {
+    console.log(`[plaid-webhook] sbUpsertAccounts skipping, no accounts to upsert item_id=${itemId}`);
+    return;
+  }
   const rows = accounts.map((a)=>({
       user_id: userId,
       item_id: itemId,
@@ -98,10 +102,15 @@ async function sbUpsertAccounts(db, userId, itemId, accounts, plaidEnv) {
   const { error } = await db.from('plaid_accounts').upsert(rows, {
     onConflict: 'account_id'
   });
-  if (error) console.error('sbUpsertAccounts error:', error);
+  if (error) console.error('[plaid-webhook] sbUpsertAccounts error:', error);
+  else console.log(`[plaid-webhook] sbUpsertAccounts ok item_id=${itemId} rows=${rows.length}`);
 }
 async function sbUpsertTransactions(db, userId, itemId, txns, plaidEnv) {
-  if (!txns.length) return;
+  console.log(`[plaid-webhook] sbUpsertTransactions item_id=${itemId} user_id=${userId} txns=${txns.length}`);
+  if (!txns.length) {
+    console.log(`[plaid-webhook] sbUpsertTransactions skipping, no transactions item_id=${itemId}`);
+    return;
+  }
   const CHUNK = 200;
   for(let i = 0; i < txns.length; i += CHUNK){
     const chunk = txns.slice(i, i + CHUNK).map((t)=>({
@@ -119,13 +128,16 @@ async function sbUpsertTransactions(db, userId, itemId, txns, plaidEnv) {
         updated_at: new Date().toISOString(),
         plaid_env: plaidEnv
       }));
+    console.log(`[plaid-webhook] sbUpsertTransactions upserting chunk offset=${i} size=${chunk.length} item_id=${itemId}`);
     const { error } = await db.from('plaid_transactions').upsert(chunk, {
       onConflict: 'transaction_id'
     });
-    if (error) console.error('sbUpsertTransactions error:', error);
+    if (error) console.error('[plaid-webhook] sbUpsertTransactions error:', error);
+    else console.log(`[plaid-webhook] sbUpsertTransactions chunk ok offset=${i} item_id=${itemId}`);
   }
 }
 async function sbUpsertRecurring(db, userId, itemId, rec, plaidEnv) {
+  console.log(`[plaid-webhook] sbUpsertRecurring item_id=${itemId} user_id=${userId} outflows=${rec['outflow_streams']?.length ?? 0} inflows=${rec['inflow_streams']?.length ?? 0}`);
   const { error } = await db.from('plaid_recurring').upsert({
     user_id: userId,
     item_id: itemId,
@@ -137,36 +149,46 @@ async function sbUpsertRecurring(db, userId, itemId, rec, plaidEnv) {
   }, {
     onConflict: 'item_id'
   });
-  if (error) console.error('sbUpsertRecurring error:', error);
+  if (error) console.error('[plaid-webhook] sbUpsertRecurring error:', error);
+  else console.log(`[plaid-webhook] sbUpsertRecurring ok item_id=${itemId}`);
 }
 async function sbLogWebhookEvent(db, userId, itemId, payload, plaidEnv) {
+  const wtype = payload['webhook_type'] ?? null;
+  const wcode = payload['webhook_code'] ?? null;
+  console.log(`[plaid-webhook] sbLogWebhookEvent item_id=${itemId} user_id=${userId} type=${wtype} code=${wcode}`);
   const { error } = await db.from('plaid_webhook_events').insert({
     user_id: userId,
     item_id: itemId,
-    webhook_type: payload['webhook_type'] ?? null,
-    webhook_code: payload['webhook_code'] ?? null,
+    webhook_type: wtype,
+    webhook_code: wcode,
     payload: payload,
     created_at: new Date().toISOString(),
     plaid_env: plaidEnv
   });
-  if (error) console.error('sbLogWebhookEvent error:', error);
+  if (error) console.error('[plaid-webhook] sbLogWebhookEvent error:', error);
+  else console.log(`[plaid-webhook] sbLogWebhookEvent ok item_id=${itemId}`);
 }
 // ---------------------------------------------------------------------------
 // Plaid data fetchers
 // ---------------------------------------------------------------------------
 async function plaidFetchAccounts(plaid, accessToken) {
+  console.log('[plaid-webhook] plaidFetchAccounts fetching accounts from Plaid');
   const res = await plaid.accountsGet({
     access_token: accessToken
   });
-  return res.data.accounts ?? [];
+  const accounts = res.data.accounts ?? [];
+  console.log(`[plaid-webhook] plaidFetchAccounts fetched accounts=${accounts.length}`);
+  return accounts;
 }
 async function plaidFetchTransactionsAll(plaid, accessToken, days = 90) {
   const startDate = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
   const endDate = new Date().toISOString().slice(0, 10);
+  console.log(`[plaid-webhook] plaidFetchTransactionsAll start_date=${startDate} end_date=${endDate} days=${days}`);
   let txns = [];
   let offset = 0;
   const count = 100;
   while(true){
+    console.log(`[plaid-webhook] plaidFetchTransactionsAll fetching page offset=${offset} count=${count}`);
     const res = await plaid.transactionsGet({
       access_token: accessToken,
       start_date: startDate,
@@ -182,12 +204,15 @@ async function plaidFetchTransactionsAll(plaid, accessToken, days = 90) {
       ...batch
     ];
     const total = res.data.total_transactions ?? txns.length;
+    console.log(`[plaid-webhook] plaidFetchTransactionsAll page fetched batch=${batch.length} total_available=${total} fetched_so_far=${txns.length}`);
     offset += count;
     if (offset >= total || offset > 1000) break;
   }
+  console.log(`[plaid-webhook] plaidFetchTransactionsAll done total_txns=${txns.length}`);
   return txns;
 }
 async function plaidFetchRecurring(plaid, accessToken, accounts) {
+  console.log('[plaid-webhook] plaidFetchRecurring fetching recurring streams from Plaid');
   const res = await plaid.transactionsRecurringGet({
     access_token: accessToken
   });
@@ -213,6 +238,9 @@ async function plaidFetchRecurring(plaid, accessToken, accounts) {
       }
     }
   }
+  const outflowCount = data['outflow_streams']?.length ?? 0;
+  const inflowCount = data['inflow_streams']?.length ?? 0;
+  console.log(`[plaid-webhook] plaidFetchRecurring fetched outflows=${outflowCount} inflows=${inflowCount}`);
   return data;
 }
 // ---------------------------------------------------------------------------
@@ -242,6 +270,7 @@ async function refreshItemNow(db, plaid, userId, itemId, accessToken, plaidEnv, 
   console.log(`[plaid-webhook] refresh done item=${itemId} txns=${txns.length}`);
 }
 async function buildSnapshot(db, userId) {
+  console.log(`[plaid-webhook] buildSnapshot start user_id=${userId}`);
   // 1) Accounts (join with items for institution name)
   const { data: accs } = await db.from('plaid_accounts').select('account_id, name, mask, balances, item_id').eq('user_id', userId);
   const itemIds = [
@@ -306,6 +335,7 @@ async function buildSnapshot(db, userId) {
       };
     }
   }
+  console.log(`[plaid-webhook] buildSnapshot done user_id=${userId} accounts=${maskedAccounts.length} txns=${transactions.length} next_bill=${nextBill?.label ?? 'none'}`);
   return {
     default_currency: defaultCurrency,
     transactions,

@@ -43,6 +43,7 @@ async function purgePlaidSupabaseItem(db: any, userId: string, itemId: string, e
 }
 
 Deno.serve(async (req) => {
+  console.log(`[remove-plaid-item] request method=${req.method}`);
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
@@ -56,20 +57,27 @@ Deno.serve(async (req) => {
       { global: { headers: { Authorization: authHeader } } }
     );
 
+    console.log("[remove-plaid-item] verifying user JWT");
     const { data: { user }, error: userError } = await supabaseClient.auth.getUser();
     if (userError || !user) {
+      console.error("[remove-plaid-item] auth.getUser failed:", userError);
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: corsHeaders });
     }
+    console.log(`[remove-plaid-item] authenticated user_id=${user.id}`);
 
     const { item_id } = await req.json();
     if (!item_id) {
+      console.warn("[remove-plaid-item] missing item_id in request body");
       return new Response(JSON.stringify({ error: "Missing item_id" }), { status: 400, headers: corsHeaders });
     }
+    console.log(`[remove-plaid-item] item_id=${item_id}`);
 
     const db = buildAdminClient();
     const env = (Deno.env.get("PLAID_ENV") ?? "production").toLowerCase();
+    console.log(`[remove-plaid-item] plaid_env=${env}`);
 
     // 2. Fetch the access token for this item_id to ensure ownership
+    console.log(`[remove-plaid-item] fetching access token item_id=${item_id} user_id=${user.id} env=${env}`);
     const { data: secrets, error: secsErr } = await db
       .from("plaid_item_secrets")
       .select("access_token")
@@ -79,19 +87,25 @@ Deno.serve(async (req) => {
       .single();
 
     if (secsErr || !secrets) {
+      console.error(`[remove-plaid-item] item not found or unauthorized item_id=${item_id} user_id=${user.id}`, secsErr);
       return new Response(JSON.stringify({ error: "Item not found or unauthorized" }), { status: 404, headers: corsHeaders });
     }
+    console.log(`[remove-plaid-item] access token found for item_id=${item_id}`);
 
     // 3. Call Plaid to remove the item
     const plaid = buildPlaidClient(env);
     let successfullyRemoved = false;
+    console.log(`[remove-plaid-item] calling Plaid itemRemove item_id=${item_id}`);
     try {
       await plaid.itemRemove({ access_token: secrets.access_token });
-      successfullyRemoved = true; // If it doesn't throw, it succeeded!
+      successfullyRemoved = true;
+      console.log(`[remove-plaid-item] Plaid itemRemove succeeded item_id=${item_id}`);
     } catch (err: any) {
       const errCode = err?.response?.data?.error_code;
+      console.warn(`[remove-plaid-item] Plaid itemRemove threw error_code=${errCode} item_id=${item_id}`);
       // If it's already gone or token is invalid, treat as success so we can purge our DB
       if (errCode === "ITEM_NOT_FOUND" || errCode === "INVALID_ACCESS_TOKEN") {
+        console.log(`[remove-plaid-item] treating ${errCode} as success for item_id=${item_id}`);
         successfullyRemoved = true;
       } else {
         throw new Error(`Plaid Error: ${errCode}`);
@@ -100,14 +114,19 @@ Deno.serve(async (req) => {
 
     // 4. Purge from Supabase
     if (successfullyRemoved) {
+      console.log(`[remove-plaid-item] purging Supabase rows item_id=${item_id} user_id=${user.id} env=${env}`);
       await purgePlaidSupabaseItem(db, user.id, item_id, env);
-      
+      console.log(`[remove-plaid-item] Supabase rows purged item_id=${item_id}`);
+
       // Check if user has any remaining items, if not, update profile
       const { count } = await db.from('plaid_items').select('*', { count: 'exact', head: true }).eq('user_id', user.id);
+      console.log(`[remove-plaid-item] remaining plaid_items count=${count} user_id=${user.id}`);
       if (count === 0) {
+        console.log(`[remove-plaid-item] no remaining items, stamping bank_disconnected_at user_id=${user.id}`);
         await db.from('profiles').update({ bank_disconnected_at: new Date().toISOString() }).eq('user_id', user.id);
       }
 
+      console.log(`[remove-plaid-item] success item_id=${item_id} user_id=${user.id}`);
       return new Response(JSON.stringify({ ok: true, message: "Bank disconnected successfully" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });

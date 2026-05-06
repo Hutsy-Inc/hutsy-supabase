@@ -115,8 +115,11 @@ async function getChatSettings(db: any): Promise<{ enabled: boolean }> {
       .select("enabled")
       .limit(1)
       .single();
-    return { enabled: data?.enabled ?? true };
+    const enabled = data?.enabled ?? true;
+    console.log(`[app-chat] getChatSettings enabled=${enabled}`);
+    return { enabled };
   } catch {
+    console.warn("[app-chat] getChatSettings failed, defaulting to enabled=true");
     return { enabled: true };
   }
 }
@@ -198,6 +201,7 @@ async function insertAssistantMessage(
 // Build conversation history from recent DB messages (replaces in-memory session)
 // deno-lint-ignore no-explicit-any
 async function buildHistory(db: any, userId: string): Promise<string> {
+  console.log(`[app-chat] buildHistory fetching recent messages user_id=${userId}`);
   try {
     const cutoff = new Date(utcNow().getTime() - 30 * 60 * 1000).toISOString();
     const { data: rows } = await db
@@ -208,14 +212,19 @@ async function buildHistory(db: any, userId: string): Promise<string> {
       .gte("created_at", cutoff)
       .order("created_at", { ascending: false })
       .limit(10);
-    if (!rows?.length) return "";
+    if (!rows?.length) {
+      console.log(`[app-chat] buildHistory no recent messages user_id=${userId}`);
+      return "";
+    }
+    console.log(`[app-chat] buildHistory fetched messages=${rows.length} user_id=${userId}`);
     return rows
       .reverse()
       .map((r: { role: string; body: string }) =>
         `${r.role === "user" ? "user" : "bot"}: ${r.body}`
       )
       .join("\n");
-  } catch {
+  } catch (e) {
+    console.error("[app-chat] buildHistory failed:", e);
     return "";
   }
 }
@@ -269,19 +278,32 @@ async function getLastNpsSentDt(
 // deno-lint-ignore no-explicit-any
 async function cooldownOk(db: any, userId: string): Promise<boolean> {
   const last = await getLastNpsSentDt(db, userId);
-  if (!last) return true;
-  return utcNow().getTime() - last.getTime() >= NPS_COOLDOWN_DAYS * 86_400_000;
+  if (!last) {
+    console.log(`[app-chat] cooldownOk no prior NPS send, cooldown ok user_id=${userId}`);
+    return true;
+  }
+  const msSince = utcNow().getTime() - last.getTime();
+  const ok = msSince >= NPS_COOLDOWN_DAYS * 86_400_000;
+  console.log(`[app-chat] cooldownOk ms_since_last=${msSince} cooldown_days=${NPS_COOLDOWN_DAYS} ok=${ok} user_id=${userId}`);
+  return ok;
 }
 
 // deno-lint-ignore no-explicit-any
 async function ensureScheduledNps(db: any, userId: string): Promise<any> {
+  console.log(`[app-chat] ensureScheduledNps checking user_id=${userId}`);
   const latest = await getLatestNps(db, userId);
   if (
     latest &&
     ["scheduled", "pending_score", "pending_feedback"].includes(latest.status)
-  ) return latest;
+  ) {
+    console.log(`[app-chat] ensureScheduledNps existing active survey found status=${latest.status} id=${latest.id} user_id=${userId}`);
+    return latest;
+  }
 
-  if (!(await cooldownOk(db, userId))) return latest;
+  if (!(await cooldownOk(db, userId))) {
+    console.log(`[app-chat] ensureScheduledNps cooldown not met, skipping NPS creation user_id=${userId}`);
+    return latest;
+  }
 
   const nowIso = utcNowIso();
   const cohort = utcNow().toISOString().split("T")[0];
@@ -307,6 +329,7 @@ async function ensureScheduledNps(db: any, userId: string): Promise<any> {
     .from("nps_surveys")
     .insert(payload)
     .select();
+  console.log(`[app-chat] ensureScheduledNps new NPS survey created id=${created?.[0]?.id} user_id=${userId}`);
   return created?.[0] ?? payload;
 }
 
@@ -407,6 +430,7 @@ async function isSubscriptionActive(
   userId: string,
   // deno-lint-ignore no-explicit-any
 ): Promise<[boolean, any]> {
+  console.log(`[app-chat] isSubscriptionActive checking user_id=${userId}`);
   const { data: subs } = await db
     .from("subscriptions")
     .select("*")
@@ -414,22 +438,35 @@ async function isSubscriptionActive(
     .order("updated_at", { ascending: false })
     .limit(1);
   const sub = subs?.[0] ?? null;
-  if (!sub) return [false, null];
+  if (!sub) {
+    console.log(`[app-chat] isSubscriptionActive no subscription row user_id=${userId}`);
+    return [false, null];
+  }
   const status = (sub.stripe_status ?? "").toLowerCase().trim();
-  return [status === "active" || status === "trialing", sub];
+  const active = status === "active" || status === "trialing";
+  console.log(`[app-chat] isSubscriptionActive user_id=${userId} stripe_status=${status} active=${active}`);
+  return [active, sub];
 }
 
 // deno-lint-ignore no-explicit-any
 async function isBankConnected(db: any, userId: string): Promise<boolean> {
+  console.log(`[app-chat] isBankConnected checking user_id=${userId}`);
   const { data: items } = await db
     .from("plaid_items")
     .select("status")
     .eq("user_id", userId);
-  if (!items?.length) return false;
+  if (!items?.length) {
+    console.log(`[app-chat] isBankConnected no plaid_items found user_id=${userId}`);
+    return false;
+  }
   for (const it of items) {
     const st = String(it.status || "").toLowerCase();
-    if (["connected", "active", "good"].includes(st)) return true;
+    if (["connected", "active", "good"].includes(st)) {
+      console.log(`[app-chat] isBankConnected connected item found status=${st} user_id=${userId}`);
+      return true;
+    }
   }
+  console.log(`[app-chat] isBankConnected no active item found user_id=${userId}`);
   return false;
 }
 
@@ -504,6 +541,7 @@ function maskTxn(txns: any[], acctLookup: Record<string, any>) {
 
 // deno-lint-ignore no-explicit-any
 async function getSnapshot(db: any, userId: string) {
+  console.log(`[app-chat] getSnapshot start user_id=${userId}`);
   const [
     { data: profileRows },
     { data: items },
@@ -580,6 +618,7 @@ async function getSnapshot(db: any, userId: string) {
     0,
   );
 
+  console.log(`[app-chat] getSnapshot done user_id=${userId} accounts=${maskedAccounts.length} txns=${maskedTx.length} outflows=${outflows.length}`);
   return {
     profile: {
       full_name: profile?.full_name ?? "Hutsy member",
@@ -693,8 +732,12 @@ async function anthropicMessage(
   userContent: string,
   maxTokens = 850,
 ): Promise<string> {
+  console.log(`[app-chat] anthropicMessage calling API model=${ANTHROPIC_MODEL} max_tokens=${maxTokens}`);
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return "AI is not configured (missing ANTHROPIC_API_KEY).";
+  if (!apiKey) {
+    console.error("[app-chat] anthropicMessage ANTHROPIC_API_KEY not set");
+    return "AI is not configured (missing ANTHROPIC_API_KEY).";
+  }
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -710,7 +753,9 @@ async function anthropicMessage(
     }),
   });
   const j = await res.json();
-  return (j.content?.[0]?.text ?? "").trim();
+  const text = (j.content?.[0]?.text ?? "").trim();
+  console.log(`[app-chat] anthropicMessage response length=${text.length}`);
+  return text;
 }
 
 // deno-lint-ignore no-explicit-any
@@ -816,6 +861,7 @@ async function agentPlan(
   mode: string,
   // deno-lint-ignore no-explicit-any
 ): Promise<Record<string, any>> {
+  console.log(`[app-chat] agentPlan start mode=${mode} history_length=${history.length} msg_length=${userMsg.length}`);
   const system =
     "You are a planner for a finance assistant. Return ONLY valid JSON. No markdown, no extra text.";
   const user = [
@@ -841,6 +887,7 @@ async function agentPlan(
   plan.clarifying_question ??= null;
   plan.focus_account_last4 ??= null;
   plan.task ??= "general";
+  console.log(`[app-chat] agentPlan result needs=${plan.needs} task=${plan.task} has_clarifying_question=${!!plan.clarifying_question}`);
   return plan;
 }
 
@@ -853,6 +900,7 @@ async function agentChatApp(
   // deno-lint-ignore no-explicit-any
   subRow: any,
 ): Promise<string> {
+  console.log(`[app-chat] agentChatApp start mode=${mode} bank_connected=${!!(snapshot.masked_accounts?.length || snapshot.transactions?.length)}`);
   const fallback =
     "I can help with balances, bills, transactions, and credit insights. What do you want to check?";
 
@@ -912,6 +960,7 @@ async function agentChatApp(
 
   try {
     const reply = (await anthropicMessage(system, userContent, 260)).trim();
+    console.log(`[app-chat] agentChatApp response length=${reply.length}`);
     return reply || fallback;
   } catch (e) {
     console.error("[app-chat] agentChatApp error:", e);
@@ -929,21 +978,29 @@ async function handleNpsScore(
   body: any,
 ): Promise<Response> {
   const scoreRaw = body.score;
+  console.log(`[app-chat] handleNpsScore start user_id=${userId} score_raw=${scoreRaw}`);
   if (
     scoreRaw === null || scoreRaw === undefined ||
     !String(scoreRaw).match(/^\d+$/)
   ) {
+    console.warn(`[app-chat] handleNpsScore invalid score="${scoreRaw}" user_id=${userId}`);
     return err("score must be an integer 0-10");
   }
   const scoreI = parseInt(String(scoreRaw));
-  if (scoreI < 0 || scoreI > 10) return err("score must be 0-10");
+  if (scoreI < 0 || scoreI > 10) {
+    console.warn(`[app-chat] handleNpsScore score out of range score=${scoreI} user_id=${userId}`);
+    return err("score must be 0-10");
+  }
 
   const survey = await getLatestNps(db, userId);
   if (!survey || survey.status !== "pending_score") {
+    console.log(`[app-chat] handleNpsScore no pending_score survey found, ignoring user_id=${userId} survey_status=${survey?.status ?? "none"}`);
     return ok({ ignored: true });
   }
+  console.log(`[app-chat] handleNpsScore survey found id=${survey.id} status=${survey.status}`);
 
   const tag = scoreI >= 9 ? "promoter" : scoreI >= 6 ? "passive" : "detractor";
+  console.log(`[app-chat] handleNpsScore saving score=${scoreI} tag=${tag} survey_id=${survey.id} user_id=${userId}`);
   await db
     .from("nps_surveys")
     .update({
@@ -957,6 +1014,7 @@ async function handleNpsScore(
     .from("profiles")
     .update({ nps_score: scoreI, nps_tag: tag, nps_state: "pending_feedback" })
     .eq("user_id", userId);
+  console.log(`[app-chat] handleNpsScore saved score=${scoreI} tag=${tag} user_id=${userId}`);
 
   const meetingUrl = Deno.env.get("NPS_MEETING_URL") ?? "";
   const appStoreId = Deno.env.get("APP_STORE_ID") ?? "";
@@ -1011,13 +1069,22 @@ async function handleNpsFeedback(
   body: any,
 ): Promise<Response> {
   let feedback = (body.feedback ?? "").trim();
-  if (!feedback) return err("feedback required");
-  if (feedback.length > 500) feedback = feedback.slice(0, 500);
+  console.log(`[app-chat] handleNpsFeedback start user_id=${userId} feedback_length=${feedback.length}`);
+  if (!feedback) {
+    console.warn(`[app-chat] handleNpsFeedback empty feedback user_id=${userId}`);
+    return err("feedback required");
+  }
+  if (feedback.length > 500) {
+    console.log(`[app-chat] handleNpsFeedback truncating feedback to 500 chars user_id=${userId}`);
+    feedback = feedback.slice(0, 500);
+  }
 
   const survey = await getLatestNps(db, userId);
   if (!survey || survey.status !== "pending_feedback") {
+    console.log(`[app-chat] handleNpsFeedback no pending_feedback survey, ignoring user_id=${userId} survey_status=${survey?.status ?? "none"}`);
     return ok({ ignored: true });
   }
+  console.log(`[app-chat] handleNpsFeedback saving feedback survey_id=${survey.id} user_id=${userId}`);
 
   await db
     .from("nps_surveys")
@@ -1027,6 +1094,7 @@ async function handleNpsFeedback(
     .from("profiles")
     .update({ nps_feedback: feedback, nps_state: "complete" })
     .eq("user_id", userId);
+  console.log(`[app-chat] handleNpsFeedback survey completed survey_id=${survey.id} user_id=${userId}`);
 
   return ok({});
 }
@@ -1046,8 +1114,12 @@ async function handleChatSend(
   const localId = (body.local_id ?? "").trim() || null;
   const deviceId = (body.device_id ?? "").trim() || null;
   const mode = normalizeMode(body.mode);
+  console.log(`[app-chat] handleChatSend start user_id=${userId} mode=${mode} local_id=${localId ?? "none"} msg_length=${msg.length}`);
 
-  if (!msg) return err("message required");
+  if (!msg) {
+    console.warn(`[app-chat] handleChatSend empty message user_id=${userId}`);
+    return err("message required");
+  }
 
   const { enabled: logEnabled } = await getChatSettings(db);
   const userRow = logEnabled
@@ -1056,7 +1128,9 @@ async function handleChatSend(
 
   // AI consent gate (Apple requirement)
   const aiConsent = readAiConsent(req, body);
+  console.log(`[app-chat] handleChatSend ai_consent=${aiConsent} log_enabled=${logEnabled} user_id=${userId}`);
   if (aiConsent !== "granted") {
+    console.log(`[app-chat] handleChatSend AI consent gate hit ai_consent=${aiConsent} user_id=${userId}`);
     const reply = aiConsentBlockReply();
     const assistantRow = logEnabled
       ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
@@ -1137,6 +1211,7 @@ async function handleChatSend(
   // Subscription gate
   const [subActive, subRow] = await isSubscriptionActive(db, userId);
   if (!subActive) {
+    console.log(`[app-chat] handleChatSend subscription gate hit user_id=${userId}`);
     const reply = "Your plan is not active. Please update payment to continue.";
     const assistantRow = logEnabled
       ? await insertAssistantMessage(db, userId, reply, localId, deviceId, {
@@ -1150,10 +1225,12 @@ async function handleChatSend(
     });
   }
 
+  console.log(`[app-chat] handleChatSend subscription active, fetching snapshot user_id=${userId}`);
   const snapshot = await getSnapshot(db, userId);
 
   // Bank gate
   if (!(await isBankConnected(db, userId))) {
+    console.log(`[app-chat] handleChatSend bank gate hit user_id=${userId}`);
     const reply =
       "Please connect your bank in Hutsy to unlock balances, bills, and alerts.";
     const assistantRow = logEnabled
@@ -1170,6 +1247,7 @@ async function handleChatSend(
 
   // Quick action handling (chat-first CTA flows)
   const matchedAction = matchQuickActionByPrompt(msg);
+  console.log(`[app-chat] handleChatSend matched_quick_action=${matchedAction?.id ?? "none"} user_id=${userId}`);
   if (matchedAction) {
     const actionType = (matchedAction.type ?? "").toLowerCase();
     if (actionType === "loan_offers") {
@@ -1236,6 +1314,7 @@ async function handleChatSend(
   }
 
   // AI response
+  console.log(`[app-chat] handleChatSend proceeding to AI response user_id=${userId}`);
   const history = await buildHistory(db, userId);
   const reply = await agentChatApp(msg, snapshot, history, mode, subRow);
 
@@ -1250,6 +1329,7 @@ async function handleChatSend(
     assistant_message: shape(assistantRow, "assistant", reply),
   };
   if (npsPayload) resp.nps = npsPayload;
+  console.log(`[app-chat] handleChatSend success user_id=${userId} has_nps=${!!npsPayload} reply_length=${reply.length}`);
   return ok(resp);
 }
 
@@ -1257,6 +1337,7 @@ async function handleChatSend(
 // Action: quick_actions
 // ---------------------------------------------------------------------------
 function handleQuickActions(): Response {
+  console.log("[app-chat] handleQuickActions returning quick actions");
   return ok({ actions: appQuickActions() });
 }
 
@@ -1269,10 +1350,15 @@ async function handleChatHistory(
   userId: string,
   body: any,
 ): Promise<Response> {
+  console.log(`[app-chat] handleChatHistory start user_id=${userId}`);
   const { enabled } = await getChatSettings(db);
-  if (!enabled) return ok({ messages: [] });
+  if (!enabled) {
+    console.log(`[app-chat] handleChatHistory chat logging disabled, returning empty user_id=${userId}`);
+    return ok({ messages: [] });
+  }
 
   const limit = Math.max(1, Math.min(parseInt(String(body.limit ?? 80)), 200));
+  console.log(`[app-chat] handleChatHistory fetching limit=${limit} user_id=${userId}`);
   const { data: rows } = await db
     .from("chat_messages")
     .select("id,created_at,role,direction,body,channel,meta")
@@ -1281,6 +1367,7 @@ async function handleChatHistory(
     .order("created_at", { ascending: true })
     .limit(limit);
 
+  console.log(`[app-chat] handleChatHistory returned messages=${rows?.length ?? 0} user_id=${userId}`);
   return ok({ messages: rows ?? [] });
 }
 
@@ -1289,12 +1376,14 @@ async function handleChatHistory(
 // ---------------------------------------------------------------------------
 // deno-lint-ignore no-explicit-any
 async function handleChatClear(db: any, userId: string): Promise<Response> {
+  console.log(`[app-chat] handleChatClear start user_id=${userId}`);
   try {
     await db
       .from("chat_messages")
       .delete()
       .eq("user_id", userId)
       .eq("channel", "app");
+    console.log(`[app-chat] handleChatClear success user_id=${userId}`);
     return ok({});
   } catch (e) {
     console.error("[app-chat] chat_clear error:", e);
